@@ -1,0 +1,1783 @@
+[14 Oct 2026: the CA Portal (ca.fermor.in) and the Kids section were retired at the owner's request. Every CA Portal passage in this file (portal V1, CA subscriptions and billing, the CA White Label Portal, "Priority #1") is historical and is no longer a product, a plan or a roadmap item. It is kept as a record, not as a to-do list.]
+
+# KANSO — MAKE IT REAL
+## Master Implementation Prompt for Claude Code
+### From: Visual shell at localhost:9002/ops → Real production system
+
+---
+
+READ THIS ENTIRE DOCUMENT BEFORE WRITING ONE LINE OF CODE.
+
+The UI shell exists. It is at `fermor-web/app/ops/`. It works visually.
+Every number, agent recommendation, terminal log, and chat reply is fake.
+Your job is to make all of it real. Nothing about the visual layer changes.
+You are only building the backend, data layer, auth, and agent logic.
+
+The stack is already decided. Do not question it. Do not suggest alternatives.
+
+---
+
+## WHAT ALREADY EXISTS
+
+- `fermor-web` — Next.js 15.5.9 app with App Router, TypeScript, Tailwind (this doc originally said 14 — cosmetic, doesn't change anything)
+- `fermor-backend` — Fastify backend, already deployed, Prisma ORM connecting to shared Postgres
+- `ca.fermor.in` — subdomain already routed via Next.js middleware (use this pattern for `ops.fermor.in`)
+- `fetch-commodities.yml` — GitHub Actions cron job pattern to follow for all agent crons
+- Existing Prisma schema — add to it, do not rewrite it
+- `app/ops/` in `fermor-web` — confirmed present: `AgentsFeedPanel.tsx`, `AnalyticsPanel.tsx`, `AnalyticsTabs.tsx`, `ChatPanel.tsx`, `CompanyPanel.tsx`, `OpsWorkspace.tsx`, `Overlays.tsx`, `data.ts`, `icons.tsx`, `kanso.css`, `layout.tsx`, `page.tsx`, `ui.tsx` — the visual shell you are making real
+
+---
+
+## ARCHITECTURE CORRECTIONS — READ THIS BEFORE PHASE 1
+
+This document was written without direct access to this codebase. Verified directly against the real repo, five things below are wrong or missing as originally written. Everywhere later in this doc that contradicts these, follow this section instead.
+
+**1. `fermor-web` has no Prisma client and no direct database access, anywhere, at all.** Confirmed: no `prisma`, `@anthropic-ai/sdk`, `googleapis`, or `next-auth` in `fermor-web/package.json`; no `lib/prisma.ts`; no `lib/` directory at the project root. Every existing feature that touches the database (CA portal, mutual funds, currency rates) works through exactly one path: `fermor-web` calls `fermor-backend`'s Fastify API over HTTP via `NEXT_PUBLIC_API_URL` (see `src/lib/api.ts`), and only `fermor-backend` ever touches Prisma/Postgres directly. **Every code sample below that shows `fermor-web/app/api/ops/.../route.ts` importing `@/lib/prisma` directly is wrong and will not compile as written** (that import doesn't exist). The correct home for every one of those routes — terminal SSE, feed, cmo-chat, analytics, and every agent — is `fermor-backend`, as a new `ops` module, following the exact structure already used by every existing module (`src/modules/ca/`, `src/modules/currency/`, etc.): `ops.routes.ts` + `ops.controller.ts` + `ops.service.ts`. `fermor-web`'s job is only the already-built UI in `app/ops/` calling these backend endpoints with `fetch()`, the same way every other page on the site already talks to the backend. Step 4 and Step 8 below are rewritten in full to show this correctly; every step after them follows the identical pattern (backend module, not a Next.js API route).
+
+**2. Do not add NextAuth.js.** It is used nowhere in this codebase. Both existing auth surfaces — the main site (`src/context/AuthContext.tsx`) and the CA portal (`ca_token`, per `fermor-web/CLAUDE.md`) — use the same custom pattern: a backend-issued JWT (Fastify's `@fastify/jwt` plugin, `jwtSecret`/`jwtRefreshSecret` in `fermor-backend/src/config/env.ts`), stored client-side. Adding NextAuth would be a third, inconsistent auth mechanism in a codebase that already has two consistent ones. `fermor-backend/src/modules/auth/user-auth.routes.ts` already has a working OTP-email flow (`sendOtpEmail` from `src/lib/email.js`, backed by Resend) and a working `authenticate` middleware (`src/shared/middleware/authenticate.ts`) that verifies the JWT via `request.jwtVerify()`. Build ops login as a new, small extension of this exact same flow — send OTP only if the email is on the allowlist, verify OTP, issue a JWT the same way — not as NextAuth. Step 2 below is rewritten to reflect this.
+
+**3. Reuse the existing `CRON_SECRET`, don't invent `OPS_CRON_SECRET`.** `fermor-backend/src/config/env.ts` already has `cronSecret: process.env.CRON_SECRET`, already used by the currency-refresh cron endpoint (`src/modules/currency/currency.controller.ts`) with the exact `Authorization: Bearer <CRON_SECRET>` pattern this doc describes reinventing. Use the same one across all ops agent crons too, unless there's a real reason to scope them separately (there isn't, for a team-internal tool).
+
+**4. The Google service account for GSC/PageSpeed is genuinely new — nothing like it exists yet.** `config.google` in `fermor-backend/src/config/env.ts` currently only holds `clientId`/`clientSecret` (an OAuth client, likely for "Sign in with Google" on the main site) — not a service account, not GSC-related. `GOOGLE_SERVICE_ACCOUNT_JSON` and `GOOGLE_API_KEY` as described in this doc are correct and needed; they just belong in `fermor-backend`'s environment (added as new keys on the same `config` object), not `fermor-web`'s.
+
+**5. Reddit's unauthenticated public JSON search endpoint is not reliably usable anymore.** Reddit has progressively tightened rate limits and blocking on unauthenticated `.json` requests over the past couple of years; treat the code in the Reddit Agent section as a starting point to test, not a guarantee. If it gets blocked or rate-limited in practice, register a free read-only "script" app at reddit.com/prefs/apps and use OAuth (`snoowrap` or a direct token exchange) instead — still zero cost, still read-only, just authenticated.
+
+---
+
+## CONSTRAINTS — LOCKED IN, NON-NEGOTIABLE
+
+- **No BullMQ, no Redis, no Railway.** Agent jobs run as GitHub Actions workflows or Vercel Cron — whichever pattern exists already in the repo. They hit authenticated API routes, same as `fetch-commodities.yml`.
+- **No Stripe, no billing, no credits system.** Deferred entirely.
+- **No WordPress, Webflow, Framer integrations.** Not applicable — Fermor IS the Next.js repo.
+- **No public signup.** Auth is team-only allowlist. Hardcoded list of allowed emails.
+- **No WhatsApp, Telegram, Influencer Agent, Creator Portal, 17-language localization.** All cut.
+- **Reddit Agent: permanently draft-only.** Never auto-posts. Writes a draft row. User copies manually.
+- **LinkedIn Agent: draft-only until Marketing API partner application is approved.** Writes draft row.
+- **One Postgres database.** Extend the existing schema. Do not create a new database.
+- **ops.fermor.in subdomain** — wire via the same middleware pattern as `ca.fermor.in`. Do this early.
+
+---
+
+## THE ORDER OF WORK
+
+Build in exactly this sequence. Each step is a real milestone, not a wishlist.
+
+```
+PHASE 1 — FOUNDATION (nothing else works without these)                    [DONE, LIVE]
+  Step 1: Prisma schema additions
+  Step 2: Auth — team allowlist
+  Step 3: Subdomain routing (ops.fermor.in)
+  Step 4: Terminal — real logs from database
+
+PHASE 1.5 — ONBOARDING (moved up from Steps 16/17 below — see note)         [DONE, LIVE]
+  Crawl the site + generate real company documents (was Step 16/17)
+  Connect GSC / GA4 via real OAuth (folded into Step 5, corrected below)
+
+PHASE 2 — FIRST REAL DATA                                                   [DONE, LIVE]
+  Step 5: GSC integration — pull real search data
+  Step 6: Analytics panel — Traffic tab becomes real
+  Step 7: Talk to CMO — real Claude API call
+
+PHASE 3 — FIRST REAL AGENT                                            [DONE, LIVE]
+  Step 8: SEO Agent — end-to-end, first cron job
+  Step 9: Agents Feed — reads real rows, not mock array
+
+PHASE 4 — REMAINING AGENTS                                           [DONE, LIVE]
+  Build order revised 26 Aug 2026 (see progress log Section 9) -- by real
+  readiness (credentials already in hand, actual SEO value), not the
+  original numbering below. Original step numbers kept for reference.
+  Step 10: GEO Agent                                                  [DONE, LIVE]
+  Step 11: X/Twitter Agent                                            [DONE, LIVE]
+  Step 14: Articles Agent                                             [DONE, LIVE]
+  Step 13: LinkedIn Agent                                             [DONE, LIVE]
+  Step 12: Reddit Agent               -- DONE, LIVE (27 Aug 2026, see progress
+                                          log Sections 16-23). Permanently
+                                          draft-only, never auto-posts -- no
+                                          Reddit account connection needed at
+                                          all. Real discovery is genuinely
+                                          hard: Reddit closed self-service API
+                                          access in Nov 2025 and blocks/rate-
+                                          limits Vercel's own IPs almost every
+                                          run, so this ended up as three
+                                          layered paths instead of one: a
+                                          direct scan (fast, usually blocked),
+                                          a GitHub Actions relay dispatched on
+                                          click (different IP range, sometimes
+                                          gets through), and a "paste a thread
+                                          you found" manual path that always
+                                          works regardless of Reddit's
+                                          blocking. All three feed the same
+                                          draft-and-persist logic.
+  Step 15: Hacker News Agent                                          [DONE, LIVE]
+                                          (built manually-triggered, no cron --
+                                          see progress log Section 13 for why;
+                                          also genuinely better once there's a
+                                          concrete technical angle to lead
+                                          with -- e.g. the 500+ page programmatic
+                                          SEO scale -- than right now)
+  Step 16: Company documents — DONE, see PHASE 1.5 above, not deferred to last
+  Step 17: Website crawl — DONE, see PHASE 1.5 above, not deferred to last
+
+  UGC Agent and Coding Agent (mentioned in earlier drafts of this blueprint,
+  never given their own numbered step): SKIPPED, not deferred. UGC needs a
+  video production pipeline this team doesn't have to act on generated
+  briefs. Coding Agent (auto-opening GitHub PRs for SEO fixes) is redundant
+  with using Claude Code directly against the real recommendations already
+  in the feed -- no separate agent needed.
+```
+
+**Why Steps 16/17 moved to before Phase 3, not after Phase 4 as originally written:** a
+marketing tool with no company context (no real product/strategy/brand-voice docs) and no
+connected data sources isn't useful yet regardless of which individual agents exist on top
+of it — this is also the order Okara's own onboarding actually follows (crawl -> generate
+docs -> connect data sources -> then agents run). Building 6 agents against an empty
+company profile and no real analytics would have meant redoing their context-gathering
+logic later anyway. See "Make it real - progress log.txt" Section 6 for what actually
+shipped here and how it differs from the original Step 16/17 text further down this file.
+
+Do not start Phase 2 until Phase 1 is complete and working.
+Do not start Phase 3 until Phase 2 is complete and working.
+
+---
+
+## COST GUARDRAILS (added 26 Aug 2026, corrected against actual code)
+
+Real spend after this session's work: $0.28 of the $5 prepaid credit --
+almost entirely Claude's own development/verification test calls (SEO
+Agent + GEO Agent, run once each to confirm they worked before shipping),
+not production usage. Not a runaway pattern, but two real gaps are worth
+closing before more agents go live:
+
+- **CMO chat has no prompt caching and no rate limit.** `cmoChat` in
+  `ops.controller.ts` (confirmed: `model: "claude-haiku-4-5"`, already
+  Haiku, not Sonnet -- that was already resolved, not an open question)
+  rebuilds and resends the full system prompt (company docs + recent feed
+  + analytics context) on every single message, and resends the entire
+  prior conversation as `history` every turn too. Neither is cached.
+  **Correction to a claim that circulated about this:** prompt caching on
+  the Messages API is NOT automatic for "any system prompt over 1024
+  tokens" with no code change -- it requires explicit `cache_control:
+  {type: "ephemeral"}` markers on the specific content blocks you want
+  cached, and current models don't need the old
+  `anthropic-beta: prompt-caching-2024-07-31` header (that was a
+  mid-2024 beta flag; caching has been generally available on the
+  Messages API since). The real fix: mark the system prompt block with
+  `cache_control` explicitly, and cap `history` length so a long
+  conversation doesn't keep growing the resent context turn over turn.
+- **No guard against accidental duplicate agent runs.** Nothing stops the
+  same SEO/GEO agent from being triggered twice in a row (a Vercel Cron
+  retry, or a developer testing) and spending real Claude credits both
+  times. Add a short cooldown (e.g. "skip if this agent already ran in
+  the last N minutes") to the **cron-triggered** path specifically. Do
+  **not** apply a silent "already ran today, skipping" gate to the
+  user-facing "Run SEO Agent" / "Run GEO Agent" buttons in the dashboard
+  -- those are on-demand triggers by design, and silently no-opping them
+  would reintroduce the exact "nothing happens when I click it" bug this
+  session spent most of its time diagnosing and fixing (see progress log
+  Section 8). The cron path and the manual-trigger path need different
+  guards, not the same one.
+
+**Two claims that circulated alongside these but do NOT match the actual
+code, corrected here so they don't get built on top of a false premise:**
+- The SEO Agent does **not** call PageSpeed Insights and does not store
+  anything under the `SEO_HEALTH` snap type, despite `pageSpeedApiKey`
+  sitting configured in `config/env.ts` unused. There is currently no
+  Lighthouse/PageSpeed data anywhere in the system to wire the Analytics
+  panel's SEO/Technical sub-tabs to -- that integration would need to be
+  built from scratch (a real, separate step), not "wired up" from
+  existing data.
+  **DONE (29 Aug 2026, see progress log Section 46): built from scratch,
+  exactly as flagged here -- a new, separate `pagespeed.ts` (real
+  PageSpeed Insights calls, writes `SEO_HEALTH`) and `technical-audit.ts`
+  (real crawl + header/HTML checks, writes `TECHNICAL`), both wired to
+  their own real "Run X Audit" buttons in the Analytics panel, same
+  click-triggered pattern as the existing Link Audit.**
+- Twitter and LinkedIn credentials are **not** meant to live as global
+  `TWITTER_CONSUMER_KEY`-style env vars. They're already seeded as
+  per-project JSON columns (`OpsProject.twitterCredentials` /
+  `linkedinCredentials`, via `scripts/seed-social-credentials.ts`) to
+  keep the multi-tenant-shaped schema decision (Section 1) consistent --
+  every future agent should read credentials off the project row, not
+  `process.env`, even though there's only one tenant today.
+
+**Genuinely good and worth doing when the X/Twitter and LinkedIn agents
+are built:**
+- Add `linkedinTokenCreatedAt DateTime?` to `OpsProject` (new column, not
+  yet in the schema) and have the LinkedIn agent check token age before
+  running, warning instead of failing silently once it's past ~50 days.
+  LinkedIn's personal-profile token has no refresh token on this app
+  tier (Section 2) and expires in ~60 days -- this makes that expiry
+  visible instead of a silent future breakage.
+- DONE (26 Aug 2026): the Analytics panel's GEO sub-tab now reads real
+  data. Ended up reading straight from the GEO Agent's existing
+  `OpsFeedItem` rows (geoScore + citationResults already in
+  `metadata`) rather than adding a dedicated `OpsAnalyticsSnap` row --
+  simpler, no new write path needed. `GEO_SCORE`/`SEO_HEALTH` remain
+  unused enum values on `OpsSnapType` if a dedicated snapshot is ever
+  wanted later. SEO/Links/Technical sub-tabs also done same day: honest
+  "not wired to a real source" states instead of fabricated numbers.
+  See progress log Section 12 for full detail.
+- UPDATED (26 Aug 2026): Links tab is now real too, deliberately without
+  a paid backlink provider (Ahrefs/Moz/DataForSEO) -- the user does not
+  want ongoing third-party cost for this. Built a free internal
+  link-health audit instead (crawls the site's own sitemap.xml + a
+  capped page sample, real `<a>` tags only, zero AI cost) -- see
+  progress log Section 14. `INTERNAL_LINKS` added to `OpsSnapType`
+  (migration applied); `BACKLINKS` stays reserved and unused in case a
+  real third-party source is ever added later.
+
+**DONE (30 Aug 2026, see progress log Section 53): a real external cost
+breakdown of Kanso's actual Anthropic spend drove a full cost-optimization
+pass. This is now the locked-in policy for every current and future agent
+-- follow it for anything new added to this file, don't reintroduce the
+per-agent model choices this section replaces.**
+
+- **Per-agent model tier, exact, no exceptions:** CMO Chat, GEO Agent,
+  X/Twitter Agent, Articles Agent, LinkedIn Agent, Hacker News Agent ->
+  `claude-haiku-4-5`. SEO Agent, Competitor Pulse, Reddit Agent,
+  Onboarding/Company docs -> `claude-sonnet-5`. Link Audit / SEO Audit /
+  Technical Audit -> no LLM at all (crawl + PageSpeed API only, unchanged
+  from how they already worked). This is a deliberate cost-tier decision,
+  not a quality verdict -- Articles and LinkedIn moved off Sonnet
+  specifically because they're template-driven generation from fixed
+  inputs (GSC data, brand voice doc), not adaptive multi-step reasoning.
+  If a future change ever needs a different model for one of these agents,
+  treat that as reopening this policy explicitly, not a silent drift.
+- **Batch API (`anthropic.messages.batches.*`, 50% off input+output, zero
+  prompt/quality change) on every cron-only agent path**: SEO, GEO,
+  Articles, LinkedIn, X/Twitter. Wired via a shared `batch-helper.ts` so
+  each call site is a one-line `useBatch` flag, not a rewrite. Deliberately
+  NOT used for: Competitor Pulse (its tool-loop is a live multi-turn
+  conversation, incompatible with Batch API's single-request-in/results-
+  out shape), Hacker News (no cron route, manual-trigger only), or any
+  manual "run now"/regenerate button on any agent (a human is actively
+  waiting; the discount isn't worth the added latency there). A real
+  batch call was observed taking ~80s in production, well past a naive
+  "usually fast" assumption -- `vercel.json`'s `maxDuration` was raised to
+  280s (this account's real Pro-plan ceiling is 300s) to give batch
+  polling genuine room; any new batch-eligible agent added later needs a
+  `pollBudgetMs` sized against that same real observed latency, not a
+  smaller guessed number.
+- **`cache_control: { type: "ephemeral" }` on every agent's system
+  prompt** (CMO Chat, SEO, GEO, Articles, LinkedIn, Hacker News all have
+  it now) -- a large, mostly-static prompt (templates, requirements,
+  brand voice) resent on every call becomes a ~90%-cheaper cache read on
+  a repeat call inside the TTL window instead of a full fresh input. Any
+  new agent's system prompt should get this from day one, not bolted on
+  later.
+- **Free web Search/Fetch (tinyfish.ai) replaces Anthropic's own paid
+  `web_search_20260209`/`web_fetch_20260209` server tools -- Competitor
+  Pulse only, for now.** Verified directly against TinyFish's own API
+  reference before building (not a third-party blog's differently-shaped
+  example): free `GET api.search.tinyfish.ai` / `POST
+  api.fetch.tinyfish.ai`, `X-API-Key` header, no card required at their
+  published free-tier rate limits. Wired in as a plain custom Claude tool
+  (`tinyfish.ts`), not via MCP -- this backend calls Claude directly
+  through the Anthropic SDK, no MCP client in the loop, so an "MCP-native"
+  framing doesn't apply here. Being a custom (not native server) tool is
+  what makes real context-trimming possible at all: the calling code
+  builds the `tool_result` itself and caps it (`MAX_FETCH_CHARS = 3000`),
+  where a native server tool's `pause_turn` contract would require
+  resending Anthropic's own full tool result content as-is. Per-competitor
+  caps tightened to `MAX_SEARCHES_PER_COMPETITOR = 2` /
+  `MAX_FETCHES_PER_COMPETITOR = 1`, enforced in code. Requires
+  `TINYFISH_API_KEY` (Vercel env var, `fermor-backend`, Production) --
+  Competitor Pulse skips its run cleanly with a clear log message if it's
+  missing, rather than spending a real Sonnet call that's guaranteed to
+  find nothing.
+  **Deliberately out of scope for this pass, real future candidates, not
+  forgotten:** migrating CMO chat's own web_search/web_fetch tools to
+  TinyFish custom tools too (would also let CMO chat's within-turn tool
+  carryover finally be trimmed the same way, which native `pause_turn`
+  tools can't be); pointing `onboarding.service.ts`'s crawl step at
+  TinyFish Fetch instead of its current method; a possible TinyFish
+  Browser product pilot on the Reddit Agent (not attempted -- it's paid,
+  no free tier, and there's no way to confirm it clears Reddit's own
+  IP-blocking, the exact problem the GitHub Actions relay in Architecture
+  Correction #5 already exists to solve, without spending real money to
+  find out first).
+- **Competitive Intelligence module (31 Aug 2026), foundation only.** A
+  new `app/ops/ci/` frontend module -- 8 sections (Overview, Landscape,
+  Competitors, Compare, Strategy, Signals, Insights & Recommendations,
+  Sources & Settings) -- replacing the sidebar's simple "Competitors"
+  list, plus new `CiCompetitor`/`CiEvidence` backend tables (seeded from
+  the real, already-tracked `OpsProject.competitors` list, never a
+  second competitor list) and a real link from Competitor Pulse
+  findings to a specific tracked competitor (`OpsFeedItem.ciCompetitorId`).
+  Overview/Competitors/Signals/Sources are fully real; Compare's
+  feature/benchmark tabs and Strategy's 6 sub-tabs are honest,
+  clickable empty-state shells -- their real tables
+  (`CiFeature`/`CiBenchmarkScore`) don't exist yet because no real
+  per-feature research has been done. See progress log Section 55 for
+  the full build; the migration SQL still needs manual application in
+  Supabase.
+
+---
+
+## PHASE 1 — FOUNDATION
+
+### STEP 1: PRISMA SCHEMA ADDITIONS
+
+Add these models to the existing Prisma schema. Prefix all new tables with `ops_` to avoid collisions.
+
+```prisma
+// Add to existing schema.prisma
+
+model OpsProject {
+  id                String          @id @default(cuid())
+  name              String          @default("Fermor")
+  url               String          @default("https://fermor.in")
+  description       String?         @db.Text
+  targetAudience    String?         @db.Text
+  competitors       String[]
+  tags              String[]        // e.g. ["SaaS", "@fermor_in", "company/fermor"]
+
+  // Company documents (raw markdown/text, generated by Claude)
+  docProductInfo    String?         @db.Text
+  docStrategy       String?         @db.Text
+  docCompetitors    String?         @db.Text
+  docBrandVoice     String?         @db.Text
+  docArticlesPlan   String?         @db.Text
+  docUpdatedAt      DateTime?
+
+  // GSC integration
+  gscProperty       String?         // e.g. "sc-domain:fermor.in"
+  gscCredentials    Json?           // encrypted OAuth tokens
+
+  // GA integration
+  gaPropertyId      String?
+  gaCredentials     Json?
+
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  feedItems         OpsFeedItem[]
+  terminalLogs      OpsTerminalLog[]
+  analyticsSnaps    OpsAnalyticsSnap[]
+}
+
+model OpsFeedItem {
+  id            String       @id @default(cuid())
+  projectId     String
+  project       OpsProject   @relation(fields: [projectId], references: [id])
+
+  agentType     OpsAgentType
+  status        OpsFeedStatus @default(CURRENT)
+
+  // Display data
+  title         String
+  summary       String       @db.Text  // short preview text
+  content       String       @db.Text  // full content — the actual output
+  metadata      Json?        // e.g. { threadUrl, keyword, issueUrl, pageUrl, estimatedImpact }
+
+  // For articles specifically
+  articleType   String?      // SEO, How-To, Comparison, etc.
+  keyword       String?
+  wordCount     Int?
+  ogImageUrl    String?
+
+  // Action tracking
+  actedAt       DateTime?
+  archivedAt    DateTime?
+  postedAt      DateTime?
+  publishedAt   DateTime?
+
+  createdAt     DateTime     @default(now())
+}
+
+enum OpsAgentType {
+  SEO
+  GEO
+  REDDIT
+  TWITTER
+  LINKEDIN
+  ARTICLES
+  HACKER_NEWS
+  UGC
+  CODING
+  ADS
+}
+
+enum OpsFeedStatus {
+  CURRENT
+  ARCHIVED
+  POSTED
+  PUBLISHED
+  DISMISSED
+}
+
+model OpsTerminalLog {
+  id        String      @id @default(cuid())
+  projectId String
+  project   OpsProject  @relation(fields: [projectId], references: [id])
+
+  message   String
+  level     String      @default("info")  // info | success | error | warning
+  agentType OpsAgentType?
+  jobId     String?     // GitHub Actions run ID or Vercel Cron job ID
+
+  createdAt DateTime    @default(now())
+}
+
+model OpsAnalyticsSnap {
+  id           String      @id @default(cuid())
+  projectId    String
+  project      OpsProject  @relation(fields: [projectId], references: [id])
+
+  snapType     OpsSnapType
+  data         Json        // raw data for this snapshot type
+  period       String?     // "7d", "30d", etc.
+  snapshotDate DateTime    @default(now())
+}
+
+enum OpsSnapType {
+  GSC_PERFORMANCE
+  GSC_TOP_QUERIES
+  GSC_TOP_PAGES
+  GA_SESSIONS
+  GA_TOP_PAGES
+  SEO_HEALTH
+  GEO_SCORE
+  BACKLINKS
+  TECHNICAL
+}
+```
+
+After adding: run `npx prisma migrate dev --name add_ops_tables` from fermor-backend.
+Seed one OpsProject row manually with Fermor's real data (name, URL, competitors).
+
+---
+
+### STEP 2: AUTH — TEAM ALLOWLIST
+
+No public signup, and no NextAuth (see Architecture Corrections above — it doesn't exist anywhere in this codebase). Extend the existing OTP-email + JWT flow that already lives in `fermor-backend/src/modules/auth/user-auth.routes.ts`, gated by an allowlist.
+
+Create `fermor-backend/src/modules/ops/ops-auth.ts` (or add to a new `ops` module alongside the routes/controller/service files from Step 4):
+
+```typescript
+// The allowed team emails — hardcode these
+export const OPS_ALLOWED_EMAILS = [
+  "naveen@fermor.in",       // founder
+  // add team member emails here
+];
+
+export function isAllowedEmail(email: string): boolean {
+  return OPS_ALLOWED_EMAILS.includes(email.toLowerCase());
+}
+```
+
+**Login flow (backend-driven, reusing what already works):**
+1. `POST /api/v1/ops/auth/send-otp` — checks `isAllowedEmail(email)` first; if not allowed, return a generic error without revealing whether the email exists. If allowed, generate a 6-digit OTP, store it (same pattern the existing `SendOtpSchema`/`RegisterSchema` flow in `user-auth.routes.ts` already uses), and call `sendOtpEmail` from `src/lib/email.js` (Resend-backed, already working).
+2. `POST /api/v1/ops/auth/verify-otp` — verifies the OTP, then issues a JWT via the same Fastify `@fastify/jwt` plugin already configured (`jwtSecret` in `config`), with a payload shape matching the existing `JwtPayload` type (`src/shared/types/auth.ts`) plus a role/scope marker distinguishing an ops session from a regular user session.
+3. `fermor-web` stores this token client-side the same way `ca_token` is already stored for the CA portal (see `fermor-web/CLAUDE.md`'s documented pattern), not as a NextAuth session/cookie.
+4. Protect `fermor-backend`'s ops routes by reusing the existing `authenticate` middleware (`src/shared/middleware/authenticate.ts`), which already calls `request.jwtVerify()` — same middleware the `ca` module already uses for its own protected routes.
+
+Protect the `/ops` route on the `fermor-web` side (client-side check, matching how the CA portal already gates its own pages):
+```typescript
+// In the ops layout/page: read the stored ops token, verify it has a value and
+// hasn't expired client-side (or make a lightweight call to a /me-style backend
+// endpoint), redirect to /ops/login if absent — the same pattern app/ca/ already uses.
+```
+
+Create these pages in `fermor-web`:
+- `/ops/login` — clean dark login page matching the Kanso aesthetic; email input → OTP input, two-step form
+- No separate OAuth callback page needed — there is no OAuth here, just OTP + JWT
+
+---
+
+### STEP 3: SUBDOMAIN ROUTING
+
+Pattern already exists for `ca.fermor.in`. The real `fermor-web/middleware.ts` is more involved than a bare rewrite — it already branches on `host.startsWith('ca.')` first (redirecting `/` to `/ca/login`, rewriting everything else under `/ca/`), then handles the `www.` → apex redirect, then does region/calculator-slug parsing. Add the `ops.` branch as an early check in that same function, in the same style as the existing `ca.` branch, not as a standalone snippet:
+
+```typescript
+// Add near the top of middleware(), right alongside the existing `if (host.startsWith('ca.'))` block
+if (host.startsWith('ops.')) {
+  if (pathname === '/') {
+    return NextResponse.redirect(new URL('/ops/login', request.url));
+  }
+  if (!pathname.startsWith('/ops') && !pathname.startsWith('/api') && !pathname.startsWith('/_next')) {
+    const rewritten = request.nextUrl.clone();
+    rewritten.pathname = `/ops${pathname}`;
+    return NextResponse.rewrite(rewritten);
+  }
+  return NextResponse.next();
+}
+```
+
+Add `ops.fermor.in` to Vercel project domains (the `fermor-web` project, same one `ca.fermor.in` is already on).
+Test: `ops.fermor.in` → same app, same page, same auth protection.
+
+---
+
+### STEP 4: TERMINAL — REAL LOGS
+
+**The terminal must read from `OpsTerminalLog` table, not a hardcoded script.**
+
+Per the Architecture Corrections above, this lives in `fermor-backend` as a new `ops` module (not a `fermor-web` API route — there is no Prisma client on that side). Create the module following the exact same file split as `src/modules/ca/`:
+
+`fermor-backend/src/modules/ops/ops.service.ts`:
+```typescript
+import prisma from "../../lib/prisma.js";
+
+export async function getRecentLogs(projectId: string, take = 50) {
+  return prisma.opsTerminalLog.findMany({
+    where: { projectId },
+    orderBy: { createdAt: "desc" },
+    take,
+  });
+}
+
+export async function getLogsSince(projectId: string, afterId: string, take = 20) {
+  const cursorLog = await prisma.opsTerminalLog.findUnique({ where: { id: afterId } });
+  if (!cursorLog) return [];
+  return prisma.opsTerminalLog.findMany({
+    where: { projectId, createdAt: { gt: cursorLog.createdAt } },
+    orderBy: { createdAt: "asc" },
+    take,
+  });
+}
+
+export async function writeLog(
+  projectId: string,
+  message: string,
+  level: "info" | "success" | "error" | "warning" = "info",
+  agentType?: string
+) {
+  return prisma.opsTerminalLog.create({
+    data: { projectId, message, level, agentType: agentType as any },
+  });
+}
+```
+
+`fermor-backend/src/modules/ops/ops.controller.ts` (SSE via Fastify's raw response, no extra dependency needed):
+```typescript
+import { FastifyRequest, FastifyReply } from "fastify";
+import { getRecentLogs, getLogsSince } from "./ops.service.js";
+
+export async function streamTerminal(request: FastifyRequest, reply: FastifyReply) {
+  const { projectId = "default" } = request.query as { projectId?: string };
+
+  reply.raw.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+  });
+
+  const recentLogs = await getRecentLogs(projectId);
+  for (const log of recentLogs.reverse()) {
+    reply.raw.write(`data: ${JSON.stringify(log)}\n\n`);
+  }
+
+  let cursor = recentLogs[recentLogs.length - 1]?.id;
+  const interval = setInterval(async () => {
+    try {
+      if (!cursor) return;
+      const newLogs = await getLogsSince(projectId, cursor);
+      for (const log of newLogs) {
+        reply.raw.write(`data: ${JSON.stringify(log)}\n\n`);
+        cursor = log.id;
+      }
+    } catch {
+      clearInterval(interval);
+      reply.raw.end();
+    }
+  }, 3000);
+
+  request.raw.on("close", () => clearInterval(interval));
+}
+```
+
+`fermor-backend/src/modules/ops/ops.routes.ts` — register `GET /api/v1/ops/terminal` calling `streamTerminal`, gated by the `authenticate` middleware (Step 2). Register the module in `src/app.ts` the same way every other module is registered.
+
+`fermor-web`'s side is just an `EventSource` pointed at the backend:
+```typescript
+// In the Terminal component
+const source = new EventSource(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/ops/terminal?projectId=${projectId}`);
+```
+
+Update the Terminal component to use this instead of the mock script.
+All agent cron jobs write to `OpsTerminalLog` before/during/after running, via the `writeLog()` helper above — called directly from within `fermor-backend`, not over HTTP, since agents run as backend code triggered by cron.
+
+---
+
+## PHASE 2 — FIRST REAL DATA
+
+### STEP 5: GSC INTEGRATION — CORRECTED, DONE, LIVE
+
+**Goal:** Pull real Google Search Console data for fermor.in.
+
+**This entire section as originally written is wrong and was not what got built.**
+Service accounts are blocked outright on this Google Cloud project:
+`iam.disableServiceAccountKeyCreation` is auto-enforced on any GCP project tied to a
+Google Workspace domain (confirmed directly — key creation returned a hard policy error,
+not a permissions issue that could be worked around). What actually shipped instead is a
+real OAuth 2.0 flow: a dedicated OAuth client (separate from the main site's "Sign in with
+Google" client), Internal consent screen (restricted to the fermor.in Workspace, so no
+Google app-verification review needed), and a per-project refresh token — first obtained
+manually via OAuth Playground during setup, and since replaced with a live in-product
+"Connect" flow (`GET /api/v1/ops/integrations/google/start` + `/callback` in
+`fermor-backend/src/modules/ops/google-integrations.ts`) so reconnecting doesn't require
+the OAuth Playground dance again. GA4 uses the identical OAuth mechanism, just a different
+scope (`analytics.readonly` instead of `webmasters.readonly`) — both Connect buttons in the
+Traffic tab hit the same start/callback pair with a `service=gsc|ga4` query param.
+
+Setup (historical — this is what Step 5 originally said; kept for context, not what to do):
+1. Create a Google Cloud Project
+2. Enable Google Search Console API
+3. Create a Service Account → download JSON key
+4. Add service account email to GSC as a viewer for fermor.in property
+5. Store the service account JSON as an environment variable: `GOOGLE_SERVICE_ACCOUNT_JSON`
+
+This, and every other agent/integration below, lives in `fermor-backend` per the Architecture Corrections — file paths below are corrected accordingly. Add `GOOGLE_SERVICE_ACCOUNT_JSON` as a new key on `fermor-backend`'s `config.google` object (`src/config/env.ts`), alongside the existing `clientId`/`clientSecret`.
+
+Create `fermor-backend/src/modules/ops/gsc.ts`:
+
+```typescript
+import { google } from 'googleapis';
+
+const auth = new google.auth.GoogleAuth({
+  credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON!),
+  scopes: ['https://www.googleapis.com/auth/webmasters.readonly'],
+});
+
+const searchConsole = google.searchconsole({ version: 'v1', auth });
+
+export async function getGscPerformance(
+  siteUrl: string,
+  startDate: string,
+  endDate: string,
+  dimensions: string[] = ['date']
+) {
+  const response = await searchConsole.searchanalytics.query({
+    siteUrl,
+    requestBody: {
+      startDate,
+      endDate,
+      dimensions,
+      rowLimit: 1000,
+    },
+  });
+  return response.data;
+}
+
+export async function getTopQueries(siteUrl: string, days = 7) {
+  const endDate = new Date().toISOString().split('T')[0];
+  const startDate = new Date(Date.now() - days * 86400000).toISOString().split('T')[0];
+
+  const response = await searchConsole.searchanalytics.query({
+    siteUrl,
+    requestBody: {
+      startDate,
+      endDate,
+      dimensions: ['query'],
+      rowLimit: 25,
+    },
+  });
+  return response.data.rows ?? [];
+}
+
+export async function getTopPages(siteUrl: string, days = 7) {
+  const endDate = new Date().toISOString().split('T')[0];
+  const startDate = new Date(Date.now() - days * 86400000).toISOString().split('T')[0];
+
+  const response = await searchConsole.searchanalytics.query({
+    siteUrl,
+    requestBody: {
+      startDate,
+      endDate,
+      dimensions: ['page'],
+      rowLimit: 25,
+    },
+  });
+  return response.data.rows ?? [];
+}
+```
+
+Create a Vercel Cron job (or GitHub Actions workflow matching `fetch-commodities.yml`) that runs daily:
+
+```yaml
+# .github/workflows/fetch-gsc-data.yml
+name: Fetch GSC Data
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # 3 AM UTC daily
+  workflow_dispatch:
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call GSC refresh endpoint
+        run: |
+          curl -X POST https://api.fermor.in/api/v1/ops/analytics/refresh-gsc \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            -H "Content-Type: application/json"
+```
+
+Add to `fermor-backend/src/modules/ops/ops.service.ts` (alongside `writeLog` etc. from Step 4):
+```typescript
+import { getTopQueries, getTopPages } from "./gsc.js";
+
+export async function refreshGscData(projectId: string) {
+  const GSC_SITE = "sc-domain:fermor.in";
+  const [queries, pages] = await Promise.all([
+    getTopQueries(GSC_SITE, 7),
+    getTopPages(GSC_SITE, 7),
+  ]);
+
+  await prisma.opsAnalyticsSnap.createMany({
+    data: [
+      { projectId, snapType: "GSC_TOP_QUERIES", data: { rows: queries }, period: "7d" },
+      { projectId, snapType: "GSC_TOP_PAGES", data: { rows: pages }, period: "7d" },
+    ],
+  });
+}
+```
+
+Add to `fermor-backend/src/modules/ops/ops.controller.ts`:
+```typescript
+import { config } from "../../config/env.js";
+import { refreshGscData, writeLog } from "./ops.service.js";
+
+const PROJECT_ID = process.env.OPS_DEFAULT_PROJECT_ID!;
+
+export async function refreshGsc(request: FastifyRequest, reply: FastifyReply) {
+  if (request.headers.authorization !== `Bearer ${config.cronSecret}`) {
+    return reply.code(401).send({ error: "Unauthorized" });
+  }
+  await writeLog(PROJECT_ID, "Pulling Search Console data...", "info");
+  try {
+    await refreshGscData(PROJECT_ID);
+    await writeLog(PROJECT_ID, "Search Console data updated.", "success");
+    return reply.send({ ok: true });
+  } catch (e: any) {
+    await writeLog(PROJECT_ID, `GSC fetch failed: ${e.message}`, "error");
+    return reply.code(500).send({ error: e.message });
+  }
+}
+```
+
+Register `POST /api/v1/ops/analytics/refresh-gsc` in `ops.routes.ts` calling `refreshGsc` (no `authenticate` middleware here — this one's gated by the cron secret check inside the controller instead, matching the existing `currency` refresh route's pattern).
+
+---
+
+### STEP 6: ANALYTICS PANEL — TRAFFIC TAB BECOMES REAL
+
+Create the route in the `ops` backend module (`ops.routes.ts` → `ops.controller.ts`, same pattern as Steps 4-5):
+
+```
+GET https://api.fermor.in/api/v1/ops/analytics?projectId=xxx&tab=traffic&period=7d
+```
+
+This route reads the latest `OpsAnalyticsSnap` rows for the given project and returns structured data for each tab.
+
+The Traffic tab in the existing UI shows:
+- "Saw you in Google" (impressions), "Clicked through" (clicks), "Visited your site" (sessions from GA)
+- Click rate
+- 0.9x from other channels
+
+Wire the Traffic tab to read real GSC data:
+- Impressions = sum of `impressions` from GSC_TOP_QUERIES snapshot
+- Clicks = sum of `clicks` from GSC_TOP_QUERIES snapshot
+- Click rate = clicks / impressions
+- Top pages = GSC_TOP_PAGES snapshot rows
+
+Replace the hardcoded `10.2K / 65 / 41` numbers with real values.
+
+The existing UI component already has the structure — just replace the static data with a `useEffect` + `fetch(\`${process.env.NEXT_PUBLIC_API_URL}/api/v1/ops/analytics?tab=traffic\`)` call.
+
+**Status (updated 28 Aug 2026, see progress log Section 27): DONE,
+LIVE, and finally including the "X.Xx from other channels" figure this
+section always specified but never shipped.** Real site-wide totals
+(not summed from a capped row list -- see Step 8's own correction) were
+already live since the original Traffic tab pass; this update closes
+the remaining real gaps found by comparing directly against Okara:
+real GA4 metrics (sessions, returning visitors, key events, engagement
+rate, bounce rate -- the GA4 OAuth grant already existed in the
+database, just missing a stored property ID and any code that called
+the Data API), a real country breakdown (GSC's own country dimension),
+a real daily chart and real period-over-period deltas (both built from
+`OpsAnalyticsSnap` history that had been silently accumulating since
+this integration first went live, since refreshes insert rather than
+overwrite), and the "Top pages" table the backend had already been
+fetching and never rendering. Not yet confirmed end to end against a
+live Google API call from this session (a local `.env` gap, not a code
+issue) -- needs a real refresh triggered post-deploy to confirm GA4
+populates for real.
+
+---
+
+### STEP 7: TALK TO CMO — REAL CLAUDE API
+
+**SUPERSEDED (added 28 Aug 2026) -- see progress log Section 33.** The plan
+below (Haiku, 512 max_tokens, metadata-only ANALYTICS CONTEXT, rigid
+"2-4 sentences" formatting rule) is the original first-pass version and is
+no longer what's live. The real implementation now runs on
+`claude-sonnet-5` with a real tool-use loop (`cmo-tools.ts`:
+`query_search_console` and `query_analytics` tools give the model live,
+filterable, sortable GSC page/query data and GA4 site metrics on demand,
+not a snapshot dump baked into the system prompt), 4096 max_tokens, and an
+adaptive system prompt that gives the model judgment over structure
+(tables, headers, lists) instead of a fixed sentence-count rule. Replies
+are rendered as real Markdown in `ChatPanel.tsx` (`react-markdown` +
+`remark-gfm`), not `whiteSpace: pre-wrap` plain text. Kept below for
+historical reference only -- do not implement this version.
+
+Replace the canned "hi, i'm your cmo" reply with a real Claude API call. Lives in `fermor-backend` (add `@anthropic-ai/sdk` to `fermor-backend`'s dependencies, not `fermor-web`'s — `fermor-web` never calls Anthropic directly, same as it never calls Postgres directly).
+
+Add to `fermor-backend/src/modules/ops/ops.controller.ts`:
+
+```typescript
+import Anthropic from '@anthropic-ai/sdk';
+import prisma from "../../lib/prisma.js";
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const PROJECT_ID = process.env.OPS_DEFAULT_PROJECT_ID!;
+
+export async function cmoChat(request: FastifyRequest, reply: FastifyReply) {
+  const { message, history } = request.body as { message: string; history?: { role: string; content: string }[] };
+
+  // Load project context
+  const project = await prisma.opsProject.findUnique({
+    where: { id: PROJECT_ID },
+  });
+
+  // Get recent analytics for context
+  const recentSnaps = await prisma.opsAnalyticsSnap.findMany({
+    where: { projectId: PROJECT_ID },
+    orderBy: { snapshotDate: 'desc' },
+    take: 5,
+  });
+
+  // Get recent feed items for context
+  const recentFeed = await prisma.opsFeedItem.findMany({
+    where: { projectId: PROJECT_ID, status: 'CURRENT' },
+    orderBy: { createdAt: 'desc' },
+    take: 10,
+    select: { agentType: true, title: true, summary: true },
+  });
+
+  const systemPrompt = `You are the AI CMO for Fermor (fermor.in).
+
+PRODUCT CONTEXT:
+${project?.docProductInfo ?? 'Fermor is a financial calculator and tools platform for India.'}
+
+MARKETING STRATEGY:
+${project?.docStrategy ?? 'Focus on SEO-driven calculator traffic and CA network distribution.'}
+
+BRAND VOICE:
+${project?.docBrandVoice ?? 'Direct, trustworthy, no fluff. Data-driven. Never promotional.'}
+
+COMPETITORS:
+${project?.competitors?.join(', ') ?? 'ClearTax, BankBazaar, PaisaBazaar, NerdWallet'}
+
+CURRENT FEED (what agents found recently):
+${recentFeed.map(f => `- [${f.agentType}] ${f.title}: ${f.summary}`).join('\n')}
+
+ANALYTICS CONTEXT:
+${JSON.stringify(recentSnaps.map(s => ({ type: s.snapType, period: s.period, date: s.snapshotDate })))}
+
+You are a practical, data-driven marketing advisor. Be direct and specific. Reference real data when you have it. Never be generic. If asked what to do next, give a specific, actionable answer based on the actual feed items and analytics above. Keep replies concise — 2–4 sentences for simple questions, longer only when genuinely needed.`;
+
+  // Build message history for multi-turn conversation
+  const messages = [
+    ...(history ?? []).map((h: { role: string; content: string }) => ({
+      role: h.role as 'user' | 'assistant',
+      content: h.content,
+    })),
+    { role: 'user' as const, content: message },
+  ];
+
+  const response = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',  // Haiku for chat — fast and cheap
+    max_tokens: 512,
+    system: systemPrompt,
+    messages,
+  });
+
+  const replyText = response.content[0].type === 'text' ? response.content[0].text : '';
+
+  return reply.send({ reply: replyText });
+}
+```
+
+Register `POST /api/v1/ops/cmo-chat` in `ops.routes.ts` calling `cmoChat`, gated by the `authenticate` middleware (this one's a real user action from the dashboard, not a cron call, so it should require a logged-in ops session, unlike the cron-secret-gated agent/refresh routes).
+
+Update the chat component (`fermor-web/app/ops/ChatPanel.tsx`) to:
+1. POST to `${NEXT_PUBLIC_API_URL}/api/v1/ops/cmo-chat` (with the ops session token attached) with the message and conversation history
+2. Display the real reply
+3. Maintain conversation history in `useState` (array of `{ role, content }`)
+
+The morning daily rundown (shown as the first message each session):
+```typescript
+// Called once when ops dashboard loads (if no messages yet today)
+const getDailyRundown = async () => {
+  const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/ops/cmo-chat`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${opsToken}` },
+    body: JSON.stringify({
+      message: 'Give me a brief morning rundown. What did the agents find since yesterday? What should I focus on first today? Keep it to 3–4 sentences.',
+      history: [],
+    }),
+  });
+  // Display as first CMO message in the chat
+};
+```
+
+---
+
+## PHASE 3 — FIRST REAL AGENT
+
+### STEP 8: SEO AGENT — END-TO-END
+
+This is the most important step. Get one agent working completely. The rest follow the same pattern.
+
+**What the SEO Agent does:**
+1. Run PageSpeed/Lighthouse against fermor.in
+2. Check meta tags, robots.txt, sitemap.xml, llms.txt
+3. Pull GSC data for pages with high impressions but low CTR (these are the biggest opportunities)
+4. Generate 3–5 specific recommendations via Claude API
+5. Write each as an `OpsFeedItem`
+6. Write terminal logs throughout
+7. Update `OpsAnalyticsSnap` with SEO health score
+
+**Create as a handler in `fermor-backend/src/modules/ops/ops.controller.ts`** (same module as everything above — do not create a `fermor-web` API route for this):
+
+```typescript
+import { FastifyRequest, FastifyReply } from 'fastify';
+import Anthropic from '@anthropic-ai/sdk';
+import prisma from "../../lib/prisma.js";
+import { config } from "../../config/env.js";
+import { writeLog } from "./ops.service.js";
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const PROJECT_ID = process.env.OPS_DEFAULT_PROJECT_ID!;
+
+export async function runSeoAgent(request: FastifyRequest, reply: FastifyReply) {
+  if (request.headers.authorization !== `Bearer ${config.cronSecret}`) {
+    return reply.code(401).send({ error: 'Unauthorized' });
+  }
+
+  await writeLog(PROJECT_ID, 'SEO Agent starting...', 'info', 'SEO');
+
+  // Step 1: PageSpeed API
+  await writeLog(PROJECT_ID, 'Running PageSpeed audit on fermor.in...', 'info', 'SEO');
+  const psiUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=https://fermor.in&strategy=mobile&key=${process.env.GOOGLE_API_KEY}`;
+  const psiRes = await fetch(psiUrl);
+  const psiData = await psiRes.json();
+
+  const lcp = psiData.lighthouseResult?.audits?.['largest-contentful-paint']?.displayValue;
+  const fcp = psiData.lighthouseResult?.audits?.['first-contentful-paint']?.displayValue;
+  const cls = psiData.lighthouseResult?.audits?.['cumulative-layout-shift']?.displayValue;
+  const performanceScore = Math.round((psiData.lighthouseResult?.categories?.performance?.score ?? 0) * 100);
+
+  await writeLog(PROJECT_ID, `PageSpeed scores: Performance ${performanceScore}/100, LCP ${lcp}, FCP ${fcp}, CLS ${cls}`, 'info', 'SEO');
+
+  // Step 2: Check site files
+  const checks = await Promise.allSettled([
+    fetch('https://fermor.in/robots.txt').then(r => r.ok),
+    fetch('https://fermor.in/sitemap.xml').then(r => r.ok),
+    fetch('https://fermor.in/llms.txt').then(r => r.ok),
+  ]);
+  const [hasRobots, hasSitemap, hasLlmsTxt] = checks.map(c => c.status === 'fulfilled' && c.value);
+
+  await writeLog(PROJECT_ID, `Site files: robots.txt=${hasRobots}, sitemap.xml=${hasSitemap}, llms.txt=${hasLlmsTxt}`, 'info', 'SEO');
+
+  // Step 3: Get GSC data — pages with high impressions, low CTR
+  const recentGscSnap = await prisma.opsAnalyticsSnap.findFirst({
+    where: { projectId: PROJECT_ID, snapType: 'GSC_TOP_PAGES' },
+    orderBy: { snapshotDate: 'desc' },
+  });
+
+  const gscPages = (recentGscSnap?.data as any)?.rows ?? [];
+  const lowCtrPages = gscPages
+    .filter((p: any) => p.impressions > 100 && p.ctr < 0.03)
+    .slice(0, 5)
+    .map((p: any) => ({
+      page: p.keys[0],
+      impressions: p.impressions,
+      clicks: p.clicks,
+      ctr: (p.ctr * 100).toFixed(1) + '%',
+      position: p.position.toFixed(1),
+    }));
+
+  await writeLog(PROJECT_ID, `Found ${lowCtrPages.length} pages with high impressions but low CTR`, 'info', 'SEO');
+
+  // Step 4: Generate recommendations via Claude
+  await writeLog(PROJECT_ID, 'Generating SEO recommendations...', 'info', 'SEO');
+
+  const prompt = `You are an SEO specialist analyzing fermor.in, a financial calculator platform for India.
+
+AUDIT DATA:
+- Mobile PageSpeed score: ${performanceScore}/100
+- LCP: ${lcp}, FCP: ${fcp}, CLS: ${cls}
+- robots.txt: ${hasRobots ? 'exists' : 'MISSING'}
+- sitemap.xml: ${hasSitemap ? 'exists' : 'MISSING'}
+- llms.txt: ${hasLlmsTxt ? 'exists' : 'MISSING — important for AI citation'}
+
+PAGES WITH HIGH IMPRESSIONS BUT LOW CTR (biggest opportunity):
+${JSON.stringify(lowCtrPages, null, 2)}
+
+Generate exactly 4 specific, actionable SEO recommendations. For each:
+1. Name the exact issue
+2. Name the exact page if applicable
+3. State the specific fix (exact text for a title tag or meta description if relevant)
+4. State the expected impact
+
+Format as JSON array:
+[
+  {
+    "title": "short title for the fix",
+    "summary": "one sentence summary",
+    "content": "full detailed recommendation with exact text to change",
+    "pageUrl": "https://fermor.in/specific-page or null",
+    "estimatedImpact": "low|medium|high"
+  }
+]
+
+Return ONLY the JSON array. No preamble.`;
+
+  const aiResponse = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 1500,
+    messages: [{ role: 'user', content: prompt }],
+  });
+
+  const rawText = aiResponse.content[0].type === 'text' ? aiResponse.content[0].text : '[]';
+  let recommendations: any[] = [];
+  try {
+    recommendations = JSON.parse(rawText);
+  } catch {
+    await writeLog(PROJECT_ID, 'Failed to parse SEO recommendations JSON', 'error', 'SEO');
+    return reply.code(500).send({ error: 'Parse failed' });
+  }
+
+  // Step 5: Write to feed
+  await prisma.opsFeedItem.createMany({
+    data: recommendations.map(r => ({
+      projectId: PROJECT_ID,
+      agentType: 'SEO',
+      status: 'CURRENT',
+      title: r.title,
+      summary: r.summary,
+      content: r.content,
+      metadata: {
+        pageUrl: r.pageUrl,
+        estimatedImpact: r.estimatedImpact,
+      },
+    })),
+  });
+
+  // Step 6: Save analytics snapshot
+  await prisma.opsAnalyticsSnap.create({
+    data: {
+      projectId: PROJECT_ID,
+      snapType: 'SEO_HEALTH',
+      data: {
+        performanceScore,
+        lcp,
+        fcp,
+        cls,
+        hasRobots,
+        hasSitemap,
+        hasLlmsTxt,
+        lowCtrPages,
+        recommendationCount: recommendations.length,
+      },
+      period: '1d',
+    },
+  });
+
+  await writeLog(PROJECT_ID, `SEO Agent complete. ${recommendations.length} recommendations added to feed.`, 'success', 'SEO');
+
+  return reply.send({ ok: true, count: recommendations.length });
+}
+```
+
+Register `POST /api/v1/ops/agents/seo` in `ops.routes.ts` calling `runSeoAgent` (no `authenticate` middleware — gated by the cron-secret check inside the handler, same as the GSC refresh route).
+
+**Create the GitHub Actions workflow:**
+
+```yaml
+# .github/workflows/agent-seo.yml
+name: SEO Agent
+
+on:
+  schedule:
+    - cron: '0 1 * * *'  # 1 AM UTC daily (6:30 AM IST)
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run SEO Agent
+        run: |
+          curl -X POST https://api.fermor.in/api/v1/ops/agents/seo \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            -H "Content-Type: application/json"
+```
+
+If `CRON_SECRET` isn't already a GitHub repository secret for this repo, add it (long random string) — check first, since the existing `fetch-commodities.yml` cron likely already has it.
+
+---
+
+### STEP 9: AGENTS FEED — READS REAL ROWS
+
+The existing feed UI has a hardcoded `AGENTS` array. Replace it.
+
+Create the routes in the `ops` backend module: `GET /api/v1/ops/feed?projectId=xxx&status=CURRENT` and `PATCH /api/v1/ops/feed`.
+
+```typescript
+// fermor-backend/src/modules/ops/ops.controller.ts (add to the same file as the handlers above)
+import prisma from "../../lib/prisma.js";
+
+export async function getFeed(request: FastifyRequest, reply: FastifyReply) {
+  const { projectId = process.env.OPS_DEFAULT_PROJECT_ID!, status = 'CURRENT' } =
+    request.query as { projectId?: string; status?: string };
+
+  const items = await prisma.opsFeedItem.findMany({
+    where: { projectId, status: status as any },
+    orderBy: { createdAt: 'desc' },
+    take: 50,
+  });
+
+  return reply.send({ items });
+}
+
+export async function updateFeedItem(request: FastifyRequest, reply: FastifyReply) {
+  // Archive, mark as posted, mark as done
+  const { itemId, action } = request.body as { itemId: string; action: string };
+
+  const statusMap: Record<string, string> = {
+    archive: 'ARCHIVED',
+    post: 'POSTED',
+    publish: 'PUBLISHED',
+    dismiss: 'DISMISSED',
+  };
+
+  const item = await prisma.opsFeedItem.update({
+    where: { id: itemId },
+    data: {
+      status: statusMap[action] as any,
+      actedAt: new Date(),
+      ...(action === 'post' ? { postedAt: new Date() } : {}),
+      ...(action === 'publish' ? { publishedAt: new Date() } : {}),
+    },
+  });
+
+  return reply.send({ item });
+}
+```
+
+Register both in `ops.routes.ts`, gated by the `authenticate` middleware (real user actions from the dashboard, same as `cmoChat`).
+
+Update the feed component (`fermor-web/app/ops/AgentsFeedPanel.tsx`):
+1. On mount: `fetch(\`${NEXT_PUBLIC_API_URL}/api/v1/ops/feed?status=CURRENT\`)` (with the ops session token attached) → populate feed
+2. Group items by `agentType` for the accordion display (matching the existing UI)
+3. Each action button (Archive, Mark Done, Copy) calls `PATCH ${NEXT_PUBLIC_API_URL}/api/v1/ops/feed` with the itemId and action
+4. Count of items per agent updates in the accordion header (e.g. "SEO AGENT — 12 recommendations ready")
+
+The grouping logic:
+```typescript
+const grouped = items.reduce((acc, item) => {
+  if (!acc[item.agentType]) acc[item.agentType] = [];
+  acc[item.agentType].push(item);
+  return acc;
+}, {} as Record<string, OpsFeedItem[]>);
+```
+
+The existing accordion UI already renders the agent cards. Just feed real data into it.
+
+---
+
+## PHASE 4 — REMAINING AGENTS
+
+Follow the exact same corrected pattern as the SEO Agent (Step 8) for each — every agent below lives in `fermor-backend`, not `fermor-web`. The pattern is:
+1. Handler function in `fermor-backend/src/modules/ops/ops.controller.ts` (or split into per-agent files in the same module if the file gets too large), registered as `POST /api/v1/ops/agents/[name]` in `ops.routes.ts`
+2. Auth check against `config.cronSecret` (`CRON_SECRET`), same as the SEO Agent
+3. Terminal logs throughout via `writeLog()`
+4. Claude API call (Haiku for short-form, Sonnet for quality tasks) via the same `anthropic` client
+5. Write `OpsFeedItem` rows via `prisma`
+6. GitHub Actions workflow hitting `https://api.fermor.in/api/v1/ops/agents/[name]`, same as `agent-seo.yml`
+
+The prompts, cron schedules, and models below are unchanged from the original doc — those are content decisions, not architecture, and don't need correcting.
+
+Here are the prompts and specifics for each:
+
+---
+
+### COMPETITOR PULSE AGENT (added 29 Aug 2026, built for real -- not in the
+original plan below, so documented here rather than retrofitted into it)
+**Trigger:** Manual "Run" button in the Agents Feed (same as SEO/GEO --
+no cron wired yet, matching the real current state of those two agents
+too, not the aspirational cron this doc describes for them elsewhere).
+**Model:** Sonnet, with real, live `web_search_20260209`/
+`web_fetch_20260209` tools (Anthropic's own server-side tools, not a
+paid third-party competitor-intelligence vendor -- same cost discipline
+as the Links tab's free internal audit, Section 14 of the progress log).
+**What it does:** reads `project.competitors` (the real array, now
+editable from the Company panel), searches the live web for anything
+genuinely new per competitor in roughly the last 30 days (pricing,
+features, funding, content), and writes real `OpsFeedItem` findings --
+or honestly reports nothing found, which is the expected common case,
+not a failure. See progress log Section 34 for the full build, the real
+data gap it surfaced (the Company panel was showing a fake hardcoded
+competitor list, now fixed), and the still-open production migration
+this agent needs before it can actually write.
+
+---
+
+### GEO AGENT
+**Cron:** Daily at 2 AM UTC
+**Model:** Haiku 4.5
+**What it does:**
+1. Send 5–10 test queries to Claude API acting as a user ("What are the best financial calculators for India?" etc.)
+2. Check if fermor.in is mentioned in the response
+3. Check llms.txt presence and quality
+4. Generate GEO score (0–100)
+5. Generate specific recommendations for getting cited
+
+**Claude prompt for GEO analysis:**
+```
+You are evaluating fermor.in's visibility in AI-generated search results.
+
+Product: Fermor — a financial calculator and tools platform for India (fermor.in)
+llms.txt exists: [true/false]
+Schema markup: [data]
+Content structure assessment: [data]
+
+Simulate answering these 5 queries as if you were an AI assistant:
+1. "Best financial calculators for India"
+2. "SIP calculator India"
+3. "Old vs new tax regime calculator"
+4. "In-hand salary calculator India"
+5. "Home loan EMI calculator India"
+
+For each query: would you cite fermor.in? Why or why not?
+
+Then generate 3 specific content/technical recommendations to improve AI citation visibility.
+
+Return as JSON: { "geoScore": 0-100, "citationResults": [...], "recommendations": [...] }
+```
+
+---
+
+### X/TWITTER AGENT
+**Cron:** Daily at 3 AM UTC
+**Model:** Haiku 4.5
+**What it does:**
+1. Determines today's content angle (rotates: Mon=tip, Tue=observation, Wed=product insight, Thu=question, Fri=data, Sat=thread, Sun=engagement)
+2. Generates 3 tweet drafts in Fermor's brand voice
+3. Writes as `OpsFeedItem` with agentType=TWITTER
+
+**Claude prompt:**
+```
+Write 3 tweet drafts for fermor.in, a financial calculator platform for India.
+
+Brand voice: Direct, trustworthy, no jargon, data-driven. No emojis unless it's 1 subtle one. No hashtag spam. Maximum 1 hashtag if any.
+
+Today's content angle: [angle]
+
+Product context: Fermor has 85+ financial calculators covering SIP, EMI, income tax, salary, HRA, and more. All open-source formulas, no login required, no commission bias.
+
+Rules:
+- Under 280 characters each
+- Sounds like a person, not a brand
+- No "excited to announce" or hype language
+- Different angle for each of the 3 drafts
+
+Return JSON: [{ "draft": "tweet text", "angle": "what this tweet is about" }, ...]
+```
+
+Status note (updated 26 Aug 2026, see progress log Section 11-12 for
+full detail): built and live, credentials already connected. Superseded
+the original "draft-only, Copy button, no auto-post" plan with a real
+click-to-post flow instead: clicking a draft opens a right-side preview
+panel (real name/handle/avatar/verified fetched live from the connected
+X account, editable text, a real "why this works" rationale, working
+Copy and single-draft Regenerate actions) with two explicit choices --
+"Preview on X" (opens X's own compose window for manual review/edit/
+post) or "Post now" (posts immediately through the backend). Nothing
+ever posts without one of those two buttons being clicked inside that
+panel. Deliberately does not show fake reply/retweet/like counts on an
+unposted draft (a UI convention borrowed from a reference product,
+Okara, but incompatible with this project's "no invented numbers"
+rule applied everywhere else).
+
+**Personal Growth Mode (added 26 Aug 2026, see progress log Section
+15):** the agent now supports two voices, switched by a
+`twitterGrowthMode` boolean on `OpsProject` (a flag, not a second
+tenant -- it's one X account switching voice, not two accounts) and a
+visible Company/Personal toggle in the Agents Feed header. Personal
+mode uses a separate system prompt and a 7-day rotating angle set
+(founder-voice, not brand-voice) and additionally returns
+`suggestedFirstReply` (a reply to seed engagement under the poster's
+own tweet) and `needsFactCheck` (set only when the draft states a
+specific, unverifiable regulatory/numeric claim -- Claude has no live
+fact-checking ability, so this surfaces the risk instead of silently
+shipping it). Both fields render in the preview overlay next to "Why
+this works"; `needsFactCheck` renders as a distinct warning callout.
+This is one piece taken from a larger external growth-strategy
+proposal -- Engagement Scout, Thread Generator, and account-list
+seeding were explicitly deferred, not built, pending a few real days
+of Personal Growth Mode usage first.
+
+---
+
+### REDDIT AGENT
+**Cron:** Daily at 4 AM UTC
+**Model:** Sonnet 5
+**What it does:**
+1. Search Reddit API for relevant threads in target subreddits
+2. Filter for relevance and freshness (< 48 hours, > 5 upvotes)
+3. Generate a reply for each relevant thread
+4. Write as `OpsFeedItem` with thread URL in metadata
+
+**Target subreddits for Fermor:**
+```
+r/IndiaInvestments, r/IndiaTax, r/PersonalFinanceIndia, r/india, 
+r/ITRFiling, r/MutualfundsIndia, r/DesiFinance
+```
+
+**Reddit API setup:**
+Try the unauthenticated public JSON endpoint first (below), but expect it to get rate-limited or blocked at some point — Reddit has tightened this over the past couple of years, and this doc's assumption that it's reliable long-term is probably wrong (see Architecture Correction #5). If it stops working reliably, register a free read-only "script" app at reddit.com/prefs/apps and switch to an authenticated call (`snoowrap` for Node, or a direct OAuth token exchange) — still zero cost, still read-only, just not blocked.
+
+```typescript
+// Unauthenticated public JSON API — test this first, but don't assume it stays working
+const searchReddit = async (query: string, subreddit: string) => {
+  const url = `https://www.reddit.com/r/${subreddit}/search.json?q=${encodeURIComponent(query)}&sort=new&limit=10&t=day`;
+  const res = await fetch(url, { headers: { 'User-Agent': 'FermorBot/1.0' } });
+  return res.json();
+};
+```
+
+**Claude prompt for reply generation:**
+```
+You are a helpful community member on [subreddit], not a marketer.
+
+Here is a Reddit thread:
+Title: [title]
+Post: [content]
+Top comments: [comments]
+
+Here is a product you can naturally mention if relevant:
+Fermor (fermor.in) — a free financial calculator platform for India covering SIP, EMI, tax, salary, home loans. No login, no commission, formulas shown openly.
+
+Write a reply that:
+1. Directly answers the question or adds genuine value FIRST
+2. Mentions fermor.in only if it genuinely helps (not forced)
+3. Matches the subreddit's tone — conversational, not promotional
+4. Does not sound like marketing at all
+5. Is 3–6 sentences
+
+If fermor.in doesn't naturally fit, write a helpful reply without mentioning it and note "product mention skipped — didn't fit naturally."
+```
+
+**Status (updated 27 Aug 2026, see progress log Sections 16-23 for the
+full build/revise history): DONE, LIVE -- permanently draft-only, never
+auto-posts.** Feed item shows "Copy Reply" + "View Thread" only. This
+was tried as a real OAuth connect-and-post flow first (matching X/
+LinkedIn's click-to-post pattern), then explicitly reverted the same
+day for two independent, confirmed reasons: Okara's own team said their
+Reddit agent is copy-paste-only by design because Reddit's anti-spam
+systems aggressively flag automated posting, and separately, real
+research confirmed Reddit closed self-service Data API access in Nov
+2025 under a "Responsible Builder Policy" -- new OAuth app approval for
+commercial use is now a slow, often-silent manual review, not a
+same-day registration. Zero Reddit account connection is needed at all
+now; the whole OAuth flow that was briefly built was removed again.
+
+Real discovery turned out to be the hard part, not the reply-writing.
+Reddit blocks/rate-limits unauthenticated scraping from cloud IPs
+almost every request -- confirmed directly (Vercel's own function logs
+showed 6 of 7 subreddits 429'd and one 403'd, within milliseconds, on a
+real production run). The shipped design layers three independent
+paths rather than trusting one:
+1. **Direct scan** (`reddit.ts`, public `.rss` feeds, no auth) -- fast,
+   but Reddit blocks Vercel's shared IP range almost every time.
+2. **GitHub Actions relay** (`.github/workflows/reddit-scan.yml`,
+   triggered on demand by clicking "Run Reddit Agent," not on a timer,
+   to avoid unattended Claude spend) -- a different IP range that
+   sometimes gets through when Vercel's doesn't. Confirmed working for
+   real more than once (one run pulled 5 genuine drafts from
+   r/personalfinaceindia).
+3. **"Paste a thread you found"** -- a manual form in the Reddit
+   Agent's panel: paste a URL/title/body you found browsing normally,
+   Claude drafts a reply the same way. Zero dependency on Reddit's
+   blocking, always works. This is the one path guaranteed not to be
+   affected by whatever Reddit does to cloud IPs next.
+
+All three write through the same dedupe/cap/draft/persist logic, so
+none of them can drift out of sync with the others. The dashboard shows
+an explicit "N new drafts found" or "no new threads this run -- paste
+one below" message after a click, instead of a scan silently coming
+back empty looking identical to something being broken.
+
+---
+
+### LINKEDIN AGENT
+**Cron:** 3× per week (Mon, Wed, Fri at 5 AM UTC)
+**Model:** Sonnet 5
+**What it does:**
+Generates 1 LinkedIn post in founder voice (Naveen's voice)
+
+**Claude prompt:**
+```
+Write a LinkedIn post for Naveen Reddy, founder of Fermor (fermor.in).
+
+About Fermor: A financial calculator platform for India. 85+ calculators for SIP, EMI, tax, salary. All formulas shown openly. No login, no commission bias.
+
+Content category for today: [rotating: behind-the-scenes build decision | lesson learned | industry observation | product milestone | contrarian take on Indian finance]
+
+Voice rules:
+- First person, sounds like a real founder
+- Short paragraphs with line breaks for LinkedIn
+- Specific, not generic — mention actual numbers or decisions
+- No rocket emojis, "excited to announce", "thrilled to share"
+- 150–220 words
+
+Return just the post text. No labels, no preamble.
+```
+
+**Status: Draft-only** until LinkedIn Marketing API partner application is filed. Feed item shows "Copy" button.
+
+---
+
+### ARTICLES AGENT
+**Cron:** 3× per week (Mon, Wed, Fri at 6 AM UTC)
+**Model:** Sonnet 5
+**What it does:**
+1. Pull keyword data from GSC — queries with impressions > 50, position > 10 (not yet ranking well)
+2. Pick the highest-potential keyword
+3. Determine article type
+4. Generate full article
+5. Save as `OpsFeedItem` with full markdown content
+
+**Claude prompt for article generation:**
+```
+Write a complete SEO article for fermor.in.
+
+Target keyword: [keyword]
+Article type: [How-To | Comparison | Guide | Listicle]
+Target audience: Indian salaried professionals, first-generation investors
+
+Brand voice: Direct, trustworthy, no financial jargon, data-driven. Never promotional.
+
+Article requirements:
+- Keyword in title, first paragraph, 2–3 subheadings
+- 900–1,200 words
+- H2 and H3 subheadings
+- Real examples with actual Indian numbers (₹ amounts)
+- Link to relevant fermor.in calculator at least twice contextually
+- CTA at the end pointing to the most relevant fermor.in tool
+- No padding, no filler, every paragraph earns its place
+
+Write the complete article in Markdown. Start with the title (# Title).
+```
+
+**Display in feed:** Full article preview in an expanded overlay (the existing Video/script overlay component can be repurposed). "Copy Markdown" button. "Download as .md" button.
+
+---
+
+### HACKER NEWS AGENT
+**Cron:** Weekly on Tuesday at 7 AM UTC
+**Model:** Sonnet 5
+**What it does:**
+Generates 3 Show HN post variations
+
+**UPGRADED (added 29 Aug 2026) -- see progress log Section 44.** The plan
+below (title/body/angle only, no `firstComment`) is the original
+first-pass version and is no longer what's live. Prompted by directly
+reading a competitor's own published Hacker News methodology skill,
+each variation now also includes a real `firstComment` draft (what the
+poster says right after submitting), `timingGuidance` (a real, concrete
+sentence on when to actually submit), and `commentStrategy` (2-3
+anticipated hard questions with honest, grounded answers) -- since HN's
+own ranking is driven almost entirely by early velocity (upvotes/flags
+in the first hour or two), making the first comment and timing
+load-bearing, not decoration. Surfaced in the dashboard via a new,
+generic `FeedItemPreviewOverlay` used by every non-social agent, not
+just this one. Kept below for historical reference only -- the prompt
+shape has changed.
+
+**Claude prompt:**
+```
+Write 3 Show HN post variations for Fermor (fermor.in).
+
+What Fermor is: A financial calculator platform for India. 85+ calculators covering SIP, EMI, income tax, salary breakdowns, HRA, home loan eligibility. All formulas shown publicly in the UI. No login required. No ads. Formulas run client-side.
+
+Technically interesting aspects: programmatic SEO (350+ tax pages auto-generated), AI-powered CA tax planning portal (Form 16 parsing, regime comparison), calculator engine with 4+ adjustable variables per tool.
+
+Hacker News rules (strict):
+- Title starts with "Show HN:"
+- No hype words: revolutionary, game-changing, AI-powered (unless technically precise)
+- Builder's voice — share what you built, not why it's amazing
+- Body: 80–120 words, honest, specific
+- Each variation takes a different angle
+
+Angles for the 3 variations:
+1. Lead with the technical approach (programmatic pages + client-side formulas)
+2. Lead with the specific user problem it solves
+3. Lead with what makes it different from existing tools
+
+Return JSON: [{ "title": "...", "body": "..." }, ...]
+```
+
+---
+
+### COMPANY DOCUMENTS — REAL GENERATION
+
+The Company panel's 5 documents (Product Info, Marketing Strategy, Competitor Analysis, Brand Voice, Articles Plan) are currently hardcoded text.
+
+Make them real: generated by Claude from fermor.in's actual content.
+
+Create `POST /api/v1/ops/documents/generate` in the `ops` backend module (again, `fermor-backend`, not a `fermor-web` API route), gated by `authenticate`:
+
+```typescript
+// Triggered manually from the Company panel "Refresh" button
+// Or automatically during initial setup
+
+const DOCUMENTS = {
+  productInfo: {
+    model: 'claude-haiku-4-5-20251001',
+    prompt: (scrapedContent: string) => `Based on this website content from fermor.in, write a structured Product Information document. Cover: what the product does, who it's for, key features, positioning, and what makes it unique. Use structured markdown with headers. \n\nWEBSITE CONTENT:\n${scrapedContent}`,
+    field: 'docProductInfo',
+  },
+  strategy: {
+    model: 'claude-sonnet-5',
+    prompt: (scrapedContent: string) => `Based on this financial calculator platform for India, create a specific marketing growth playbook. Cover: which channels to prioritize (with reasoning), what messaging to lead with, content themes, and first 90-day priorities. Be specific to this product, not generic. \n\nPRODUCT CONTEXT:\n${scrapedContent}`,
+    field: 'docStrategy',
+  },
+  competitorAnalysis: {
+    model: 'claude-sonnet-5',
+    prompt: (content: string) => `Compare fermor.in against these competitors: ClearTax, BankBazaar, PaisaBazaar, NerdWallet (US), Calculator.net. For each competitor: what they do well, where they fall short, where fermor.in has a genuine advantage. Be honest and specific. \n\nFERMOR CONTEXT:\n${content}`,
+    field: 'docCompetitors',
+  },
+  brandVoice: {
+    model: 'claude-sonnet-5',
+    prompt: (content: string) => `Define a brand voice guide for fermor.in. Tone adjectives, writing style, words to use, words to avoid, 5 example sentences showing the voice. Based on: direct, trustworthy, data-driven, no-jargon, never promotional. \n\nPRODUCT CONTEXT:\n${content}`,
+    field: 'docBrandVoice',
+  },
+};
+```
+
+**Website crawl for document generation:**
+```typescript
+// Simple crawler for fermor.in pages
+const PAGES_TO_CRAWL = [
+  'https://fermor.in',
+  'https://fermor.in/about',
+  'https://fermor.in/calculators',
+  'https://ca.fermor.in',
+];
+
+const crawlSite = async (): Promise<string> => {
+  const contents = await Promise.all(
+    PAGES_TO_CRAWL.map(async (url) => {
+      const res = await fetch(url);
+      const html = await res.text();
+      // Strip HTML tags, get text content
+      const text = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').slice(0, 3000);
+      return `[${url}]\n${text}`;
+    })
+  );
+  return contents.join('\n\n---\n\n');
+};
+```
+
+**Status (updated 27 Aug 2026, see progress log Section 24): DONE,
+LIVE, and corrected back to this section's original intent.** The
+version that actually shipped (Section 6) generated real Claude-written
+docs from a real crawl, but its prompt asked for "strict JSON... no
+markdown fences" and word-count-bounded prose -- this section's own
+draft prompts above always said "structured markdown with headers,"
+but that instruction was dropped somewhere between this draft and what
+shipped, and the frontend (`Overlays.tsx`) never had a Markdown
+renderer at all (just `content.split(/\n{2,}/)` into `<p>` tags). Net
+effect: every doc rendered as one flat wall of text. Fixed on both
+ends: the backend prompt now requires real Markdown per field
+following an explicit template per doc type, generated via
+`client.messages.parse()` + a Zod output schema (structured outputs)
+rather than free-text JSON + regex extraction -- needed because
+Claude's real multi-line Markdown broke the old regex/JSON.parse
+approach immediately (unescaped newlines inside a JSON string is
+invalid JSON). The frontend now renders via `react-markdown`. Verified
+against a real crawl of fermor.in and the real production docs were
+regenerated with the fixed pipeline, not left stale.
+
+**Second update, same day (see progress log Section 25): these 5 docs
+are no longer only ever AI-generated.** `POST /company/docs` (key +
+content) is a real manual edit/upload path -- a person can paste or
+upload the real, current version of any of the 5 documents directly,
+independent of `runOnboarding`'s AI crawl. `DocumentOverlay`'s
+previously-dead Copy/Edit/Download buttons are now real (Edit -> a
+textarea + Upload-a-local-file + Save; Download -> a real `.md` file).
+`remark-gfm` and ordered-list styling were added since real content
+uses both tables and numbered lists. All 5 docs were then populated
+with real, hand-authored content for the first time: Product
+Information, Marketing Strategy, Brand Voice, and Competitor Analysis
+each replaced with a real source document; Articles Plan replaced with
+two combined real documents (a ClearTax content-replication tracker and
+a live GSC traffic-drop incident report), each demoted a heading level
+to nest correctly as sub-sections of one document.
+
+---
+
+## ENVIRONMENT VARIABLES — COMPLETE LIST
+
+Corrected from the original: almost everything below belongs to **`fermor-backend`** (Vercel project settings for that project + GitHub repository secrets), not `fermor-web` — `fermor-web` never talks to Postgres, Anthropic, or Google APIs directly. `NEXTAUTH_SECRET`/`NEXTAUTH_URL` are removed entirely (no NextAuth, see Architecture Correction #2); `fermor-backend` already has `JWT_SECRET`/`JWT_REFRESH_SECRET` doing this job.
+
+```env
+# fermor-backend — existing, already in the project
+DATABASE_URL=
+JWT_SECRET=
+JWT_REFRESH_SECRET=
+CRON_SECRET=                 # Already exists (used by fetch-commodities.yml / currency refresh) — reuse it, don't add a new OPS_CRON_SECRET
+
+# fermor-backend — new, needed for this build
+ANTHROPIC_API_KEY=
+OPS_DEFAULT_PROJECT_ID=      # The cuid() of the first OpsProject row after seeding
+GOOGLE_SERVICE_ACCOUNT_JSON= # New key on config.google in src/config/env.ts — full JSON of service account key (stringified)
+GOOGLE_API_KEY=              # For PageSpeed API (can use same Google Cloud project as the service account)
+
+# Reddit (read-only for search)
+# Try with no credentials first (public .json endpoint), but budget for needing a
+# registered read-only "script" app (reddit.com/prefs/apps) if that gets blocked —
+# see the Reddit Agent section and Architecture Correction #5
+
+# Optional — for future X auto-posting
+TWITTER_CLIENT_ID=
+TWITTER_CLIENT_SECRET=
+TWITTER_ACCESS_TOKEN=
+TWITTER_ACCESS_SECRET=
+
+# fermor-web — the only new var this app actually needs
+# (NEXT_PUBLIC_API_URL already exists and already points at https://api.fermor.in)
+```
+
+---
+
+## FILE STRUCTURE — NEW FILES TO CREATE
+
+Corrected: almost all logic lives in `fermor-backend` as one `ops` module (matching the existing `ca`/`currency`/etc. module shape), not scattered across `fermor-web/app/api/ops/*`. `fermor-web` only gets a login page — everything else is the UI shell that already exists in `app/ops/`, now making real `fetch()` calls instead of using mock data.
+
+```
+fermor-backend/
+  src/
+    modules/
+      ops/
+        ops.routes.ts       ← registers every endpoint below, plugged into src/app.ts like every other module
+        ops.controller.ts   ← streamTerminal, refreshGsc, cmoChat, getFeed, updateFeedItem,
+                               runSeoAgent, runGeoAgent, runTwitterAgent, runRedditAgent,
+                               runLinkedinAgent, runArticlesAgent, runHnAgent, generateDocuments
+        ops.service.ts      ← writeLog, getRecentLogs, getLogsSince, refreshGscData, and other
+                               shared data-access helpers used by the controller
+        gsc.ts              ← Google Search Console client (getGscPerformance, getTopQueries, getTopPages)
+        ops-auth.ts         ← OPS_ALLOWED_EMAILS + isAllowedEmail()
+
+fermor-web/
+  app/
+    ops/
+      login/
+        page.tsx            ← Login page (matches Kanso dark theme) — email + OTP, calls the backend
+      page.tsx              ← Existing UI shell (already built) — wire real fetch() calls in here and
+                               in AgentsFeedPanel.tsx / AnalyticsPanel.tsx / ChatPanel.tsx / CompanyPanel.tsx
+
+.github/
+  workflows/
+    agent-seo.yml           ← Daily SEO agent cron → POST https://api.fermor.in/api/v1/ops/agents/seo
+    agent-geo.yml           ← Daily GEO agent cron
+    agent-twitter.yml       ← Daily Twitter agent cron
+    agent-reddit.yml        ← Daily Reddit agent cron
+    agent-linkedin.yml      ← 3x/week LinkedIn cron
+    agent-articles.yml      ← 3x/week Articles cron
+    agent-hn.yml            ← Weekly HN cron
+    fetch-gsc-data.yml      ← Daily GSC data refresh (already created above, matches the name used there)
+```
+
+---
+
+## WIRING THE UI — WHAT CHANGES IN EXISTING COMPONENTS
+
+The UI shell is already built. These are the minimal changes needed to wire real data. Every URL below is `${NEXT_PUBLIC_API_URL}/api/v1/ops/...` (i.e. `https://api.fermor.in/api/v1/ops/...`), not a `fermor-web` `/api/ops/...` route — that env var already exists and is already used this way everywhere else in the site (`src/lib/api.ts`).
+
+**Terminal component:**
+- Remove hardcoded script array
+- Replace with `useEffect` that opens an `EventSource(\`${NEXT_PUBLIC_API_URL}/api/v1/ops/terminal?projectId=xxx\`)`
+- Append new log lines as they stream in
+
+**Agents Feed component:**
+- Remove `AGENTS` mock array
+- Add `useEffect` that fetches from `${NEXT_PUBLIC_API_URL}/api/v1/ops/feed?status=CURRENT` (with the ops session token attached)
+- Group by `agentType`, map to existing accordion structure
+- Count of items in accordion header comes from real data
+- Action buttons call `PATCH ${NEXT_PUBLIC_API_URL}/api/v1/ops/feed`
+
+**Talk to CMO chat:**
+- Remove canned reply
+- POST message + history to `${NEXT_PUBLIC_API_URL}/api/v1/ops/cmo-chat`
+- Display streaming or awaited reply
+- Store conversation history in `useState`
+- On mount: auto-generate daily rundown if no messages today
+
+**Analytics Traffic tab:**
+- Remove hardcoded 10.2K / 65 / 41 numbers
+- Fetch from `${NEXT_PUBLIC_API_URL}/api/v1/ops/analytics?tab=traffic&period=7d`
+- Display real impressions, clicks, sessions
+
+**Company documents:**
+- Each document "Edit" button should save to `PATCH ${NEXT_PUBLIC_API_URL}/api/v1/ops/documents`
+- Document content loaded from `GET ${NEXT_PUBLIC_API_URL}/api/v1/ops/project`
+- "Refresh" button triggers `POST ${NEXT_PUBLIC_API_URL}/api/v1/ops/documents/generate`
+
+---
+
+## THE FIRST WORKING SESSION — WHAT DONE LOOKS LIKE
+
+After completing Phase 1 and Phase 2, the dashboard should:
+
+1. Require login — team members only
+2. Load at `ops.fermor.in` or `localhost:9002/ops`
+3. Show a real terminal with actual log entries from the database
+4. Show real impressions, clicks data in the Traffic tab (from GSC)
+5. Give a real, intelligent reply in the chat based on Fermor's actual context
+6. Show the daily rundown message when you open the dashboard each morning
+
+After Phase 3 (SEO Agent):
+
+6. SEO AGENT accordion shows real count of recommendations
+7. Each recommendation is specific to actual fermor.in pages and issues
+8. Clicking a recommendation shows the real content — actual page URL, actual fix description
+9. Archive and Copy buttons work and update the database
+
+That is the definition of done for the first three phases.
+Everything after that follows the same pattern.
+
+---
+
+## START HERE
+
+```bash
+# 1. Add schema additions to the existing Prisma schema
+# 2. Run migration
+cd fermor-backend
+npx prisma migrate dev --name add_ops_tables
+
+# 3. Seed the default OpsProject (fermor-backend has no scripts/ dir yet and uses tsx, not ts-node — create scripts/seed-ops-project.ts, run with tsx)
+npx tsx scripts/seed-ops-project.ts
+
+# 4. Copy OPS_DEFAULT_PROJECT_ID from seed output → add to .env.local
+
+# 5. Build auth first — nothing else works without it
+# 6. Wire terminal SSE — instant feedback loop during development
+# 7. Wire GSC — first real data
+# 8. Wire CMO chat — first real AI
+# 9. Build SEO agent end-to-end
+# 10. Wire feed to real data
+```
+
+From this point, every agent follows the same pattern. Build one, test it, ship it. Then the next.
+
+Do not try to build all agents at once. Build one working agent. Then copy the pattern.

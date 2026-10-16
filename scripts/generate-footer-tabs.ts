@@ -1,0 +1,71 @@
+// Builds src/components/common/footerTabs.ts, the data behind the tabbed link section of
+// SiteFooter. Every link comes from an inventory the site already has (CATEGORIES in
+// src/data/calculators.ts, the AMC hub folders, ARTICLES in app/blogs/articles.ts, the
+// programmatic tax folders) and is checked against a real route folder here, so a footer link
+// can never point at a page that does not exist.
+//
+// Run: npx tsx scripts/generate-footer-tabs.ts
+// The output is checked in so the footer does not ship the full calculator and article
+// inventories to every page. Re-run after adding a calculator or article you want listed.
+import fs from 'fs';
+import path from 'path';
+import { CATEGORIES } from '../src/data/calculators';
+import { ARTICLES } from '../app/blogs/articles';
+
+const ROOT = path.join(__dirname, '..');
+const exists = (rel: string) => fs.existsSync(path.join(ROOT, 'app', rel, 'page.tsx'));
+
+type Item = { l: string; href: string };
+const calcTitle = new Map(CATEGORIES.flatMap(c => c.items.map(i => [i.slug, i.title] as const)));
+const calc = (slugs: string[]): Item[] =>
+  slugs.map(s => {
+    if (!calcTitle.has(s) || !exists(`calculators/${s}`)) throw new Error(`calculator not found: ${s}`);
+    return { l: calcTitle.get(s)!, href: `/calculators/${s}` };
+  });
+
+const investing = calc(['sip-calculator', 'lumpsum-calculator', 'step-up-sip-calculator', 'swp-calculator', 'cagr-calculator', 'xirr-calculator', 'mutual-fund-calculator', 'fd-calculator', 'ppf-calculator', 'nps-calculator', 'ssy-calculator', 'compound-interest-calculator', 'wealth-growth-calculator', 'real-return-calculator', 'money-doubling-calculator']);
+const loans = calc(['emi-calculator', 'home-loan-calculator', 'car-loan-calculator', 'loan-calculator', 'mortgage-calculator', 'loan-prepayment-calculator', 'loan-amortization-calculator', 'loan-eligibility-calculator', 'home-loan-eligibility-calculator', 'credit-card-emi-calculator', 'credit-utilization-calculator', 'debt-to-income-ratio-calculator', 'education-loan-emi-calculator', 'debt-snowball-calculator', 'debt-avalanche-calculator']);
+const tax = calc(['income-tax-calculator', 'old-vs-new-tax-regime-calculator', 'hra-calculator', 'in-hand-salary-calculator', 'ctc-calculator', 'salary-hike-calculator', 'capital-gains-calculator', 'gratuity-calculator', 'tds-calculator', 'surcharge-calculator', 'advance-tax-calculator', 'form16-tax-calculator', 'tax-refund-calculator', 'effective-tax-rate-calculator', 'gst-calculator']);
+
+const amcPriority = ['sbi', 'hdfc', 'icici-prudential', 'axis', 'kotak-mahindra', 'nippon-india', 'aditya-birla-sun-life', 'uti', 'dsp', 'mirae-asset', 'tata', 'franklin-templeton', 'bandhan', 'ppfas', 'motilal-oswal'];
+const amcName: Record<string, string> = { ppfas: 'PPFAS', sbi: 'SBI', hdfc: 'HDFC', icici: 'ICICI', uti: 'UTI', dsp: 'DSP', 'icici-prudential': 'ICICI Prudential', 'kotak-mahindra': 'Kotak Mahindra', 'nippon-india': 'Nippon India', 'aditya-birla-sun-life': 'Aditya Birla Sun Life', 'mirae-asset': 'Mirae Asset', 'franklin-templeton': 'Franklin Templeton', 'motilal-oswal': 'Motilal Oswal', axis: 'Axis', tata: 'Tata', bandhan: 'Bandhan' };
+const amcs: Item[] = amcPriority.map(k => {
+  const slug = `${k}-mutual-fund`;
+  if (!exists(`mutual-funds/amc/${slug}`) && !fs.existsSync(path.join(ROOT, 'app', 'mutual-funds', 'amc', '[amcSlug]'))) throw new Error(`amc route missing`);
+  return { l: `${amcName[k]} Mutual Fund`, href: `/mutual-funds/amc/${slug}` };
+});
+
+const blogs: Item[] = ARTICLES.filter(a => exists(`blogs/${a.slug}`)).slice(0, 15).map(a => ({ l: a.title, href: `/blogs/${a.slug}` }));
+
+const lakhs = [5, 6, 7, 8, 9, 10, 12, 15, 18, 20, 25, 30, 40, 50];
+const taxGuides: Item[] = lakhs.map(n => {
+  if (!exists(`tax/income-tax-on-${n}-lakh-salary`)) throw new Error(`tax page missing: ${n}`);
+  return { l: `Income Tax on ${n} Lakh Salary`, href: `/tax/income-tax-on-${n}-lakh-salary` };
+});
+taxGuides.push({ l: 'Tax Guides by City', href: '/tax/by-city' });
+
+const tabs = [
+  { id: 'investing', label: 'Investing', all: { l: 'All calculators', href: '/calculators' }, items: investing },
+  { id: 'loans', label: 'Loans & Credit', all: { l: 'All calculators', href: '/calculators' }, items: loans },
+  { id: 'tax', label: 'Tax & Salary', all: { l: 'All calculators', href: '/calculators' }, items: tax },
+  { id: 'mutual-funds', label: 'Mutual Funds', all: { l: 'Browse by AMC', href: '/mutual-funds/amc' }, items: amcs },
+  { id: 'tax-guides', label: 'Tax Guides', all: { l: 'All tax guides', href: '/tax' }, items: taxGuides },
+  { id: 'blogs', label: 'Blogs', all: { l: 'All blogs', href: '/blogs' }, items: blogs },
+];
+
+for (const t of tabs) for (const i of [...t.items, t.all]) {
+  const first = i.href.split('/').filter(Boolean);
+  const rel = first.join('/');
+  if (!exists(rel) && !(first[0] === 'mutual-funds' && first[1] === 'amc' && first[2])) throw new Error(`dead footer tab link: ${i.href}`);
+}
+
+const out = `// GENERATED by scripts/generate-footer-tabs.ts. Do not edit by hand; re-run the script.
+// Source: the calculator, AMC hub, tax and article inventories. Every href is checked against a
+// real route folder when this file is generated.
+export type FooterTabItem = { l: string; href: string };
+export type FooterTab = { id: string; label: string; all: FooterTabItem; items: FooterTabItem[] };
+
+export const FOOTER_TABS: FooterTab[] = ${JSON.stringify(tabs, null, 2)};
+`;
+fs.writeFileSync(path.join(ROOT, 'src', 'components', 'common', 'footerTabs.ts'), out);
+console.log('written', tabs.map(t => `${t.id}:${t.items.length}`).join(' '));

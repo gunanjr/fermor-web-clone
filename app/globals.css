@@ -1,0 +1,238 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* ── Legacy tokens (used by calculator sub-pages) ── */
+  --color-brand: #6C3AE8;
+  --color-accent: #E85A3A;
+  --color-bg: #ffffff;
+  --t: #0C6B62;
+  --td: #084F47;
+  --tl: #E8F7F5;
+  --tm: #B2E0DA;
+  --nav: #0C4A3F;
+  --navy: #0f172a;
+  --ink: #1e293b;
+  --ink2: #475569;
+  --ink3: #94a3b8;
+  --s: #f8fafb;
+  --b: #e8edf2;
+  --b2: #f1f5f9;
+  --g: #16a34a;
+  --gl: #f0fdf4;
+  --gm: #bbf7d0;
+  --sh1: 0 1px 4px rgba(0,0,0,.06);
+  --sh2: 0 4px 20px rgba(0,0,0,.08);
+  --sh3: 0 16px 48px rgba(0,0,0,.11);
+
+  /* ── New Fermor design tokens (team Figma palette — do not change) ── */
+  --lime: #C8F135;
+  --lime2: #95CC42;
+  --paleLime: #EDFBBC;
+
+  /* ── Brand tokens: the homepage's identity (see CLAUDE.md "Branding standard") ──
+     --green is the Fermor mark's fill (public/fermor-mark-2026.svg) and the homepage CTA mint.
+     Nothing outside the homepage's dashboard section (which redefines it locally) consumed the old
+     #139D49 value, so changing it here alters no existing page. --green-ink is the readable-on-white
+     companion for text: the mint itself is far too light for text on a white ground.
+     The legacy lime/deepGreen tokens above stay untouched because calculator and blog pages
+     still render with them. */
+  --green: #75FB90;
+  --green-ink: #1E7A46;
+  --brand-ink: #101214;
+  --brand-ground: #0D0F10;
+  --dark: #16140F;
+  --ink: #16140F;
+  --deepGreen: #1A3530;
+}
+
+/* Deliberately NOT `scroll-behavior: smooth` on html.
+   Native smooth scrolling animates the scroll position itself, which puts it in direct conflict
+   with scroll-linked animation: the homepage's hero is GSAP-pinned, and ScrollTrigger adjusts
+   the scroll position when a pin engages, releases or refreshes. With smooth behaviour every one
+   of those adjustments becomes an animation the user's own scrolling is simultaneously fighting,
+   which is felt as the page resisting, stuttering or drifting after the input stops. (GSAP
+   documents the incompatibility directly.) It is also why any post-hydration change in document
+   height read as the page scrolling by itself: the browser clamps the scroll offset when the
+   document shrinks under it, and with smooth behaviour that clamp *animates*. AppPromo.tsx
+   carries a comment describing exactly that, diagnosed there and worked around locally by
+   removing its own height change - this is the same bug's actual cause, so every other height
+   change on the page stops producing it too.
+   Anchor links lose their eased scroll as a result; that is the right trade for the scroll
+   itself always answering to the user immediately. Individual in-page scrollers that genuinely
+   want easing still opt in locally (app/resources does, and explicit
+   scrollIntoView({ behavior: 'smooth' }) calls are unaffected). */
+html { scroll-behavior: auto; }
+
+/* Brand text selection for the homepage, /blogs, /calculators and the general pages. Individual
+   pages (calculators, blogs, mutual funds, tax, GDP) render the in-page nav, whose spacer is the
+   marker, and keep the browser's own selection colour: no rule applies to them at all. */
+:root:not(:has(.fnav-spacer)) ::selection { background: var(--lime); color: #16140F; }
+
+/* Custom scrollbar — desktop only; mobile uses native overlaid scrollbar */
+@media (min-width: 760px) {
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-thumb { background: #C9D3BC; border-radius: 9px; }
+  ::-webkit-scrollbar-thumb:hover { background: #A9DB4B; }
+}
+
+/* Individual pages use the neutral palette, so their page scrollbar is neutral too. */
+@media (min-width: 760px) {
+  :root:has(.fnav-spacer) ::-webkit-scrollbar-thumb { background: #C4C9CD; }
+  :root:has(.fnav-spacer) ::-webkit-scrollbar-thumb:hover { background: #9FA59F; }
+}
+
+body {
+  font-family: var(--font-dm-sans), 'DM Sans', sans-serif;
+  background: #fff;
+  color: #16140F;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
+
+/* Sticky top bar shared by the blog, GDP and other article-style pages. Each page carries its
+   own copy of the markup, so the responsive behaviour lives here once, keyed on these classes.
+   Inline styles set the desktop look; the rules below need !important to override them. */
+.art-nav a { white-space: nowrap; }
+.art-nav-l, .art-nav-r { min-width: 0; }
+@media (max-width: 640px) {
+  .art-nav-in { padding-left: 14px !important; padding-right: 14px !important; }
+  .art-nav-l { gap: 10px !important; }
+  .art-nav-r { gap: 8px !important; }
+  /* The topic calculator link is the one that wraps; Get started already leads to /calculators. */
+  .art-nav-calc { display: none !important; }
+  .art-nav-cta { padding: 7px 14px !important; font-size: 12.5px !important; }
+}
+@media (max-width: 360px) {
+  .art-nav-l > span { display: none; }
+  .art-nav-l { gap: 8px !important; }
+}
+
+.font-body { font-family: var(--font-dm-sans), 'DM Sans', sans-serif; }
+
+input[type=range] {
+  -webkit-appearance: none;
+  height: 4px;
+  background: var(--b);
+  border-radius: 9px;
+  outline: none;
+  cursor: pointer;
+  width: 100%;
+}
+input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--t);
+  cursor: pointer;
+  border: 2.5px solid #fff;
+  box-shadow: 0 2px 8px rgba(12,107,98,.4);
+}
+
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .4; }
+}
+@keyframes scalePop {
+  from { opacity: 0; transform: scale(.94); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+@keyframes forecastBorderSweep {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes floaty {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-8px); }
+}
+.fu { animation: fadeUp .5s ease both; }
+
+@keyframes fdSlideUp {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes fdFadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes fdSlideDown {
+  from { opacity: 0; transform: translateY(-12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes grSlideUp {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes grFadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes grSlideDown {
+  from { opacity: 0; transform: translateY(-12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Hero waitlist field. The pill around it carries the border, so the input itself is
+   chromeless; only the placeholder needs a rule, and a pseudo-element cannot be reached
+   from the inline styles the homepage uses everywhere else. */
+.hero-waitlist-input::placeholder {
+  color: rgba(22, 20, 15, 0.36);
+  opacity: 1;
+}
+.hero-waitlist-input:disabled {
+  color: #5A5A52;
+  -webkit-text-fill-color: #5A5A52;
+  opacity: 1;
+}
+
+/* components/SubNav.tsx (about, contact, legal and regulatory pages). Inline styles carry the
+   desktop look; these classes only act on narrow screens, and SubNav is not used by any other
+   route family. */
+@media (max-width: 480px) {
+  .subnav-in { padding-left: 14px !important; padding-right: 14px !important; }
+  .subnav-all { padding: 5px 10px !important; font-size: 11.5px !important; }
+  .subnav-pre { display: none; }
+}
+@media (max-width: 400px) {
+  .subnav-parent { display: none; }
+  .subnav-brand span { display: none; }
+}
+
+/* Tax pages only (.tax-page is the root of the salary pages). Inline `1fr` tracks are really
+   minmax(auto, 1fr): the track refuses to shrink below its item's min-content width, so one wide
+   child (a row of tabs, a nowrap table header) widened the whole column and the page past the
+   viewport at 320px. min-width: 0 on the grid items restores the intended 1fr. Scoped to the
+   tax pages and to below 768px (where they drop to one column) so no other page family, and no
+   width at or above that breakpoint, changes. */
+@media (max-width: 767px) {
+  .tax-page [style*="grid-template-columns:1fr"] > *,
+  .tax-page [style*="grid-template-columns: 1fr"] > * { min-width: 0; }
+}
+
+/* Row-level wrapping fixes that must not touch the desktop layout, so they live here keyed on a
+   class rather than as inline properties. */
+@media (max-width: 400px) {
+  .tax-city-row { flex-wrap: wrap; }
+}
+
+/* Fermor light-grey button (class "fx-btn"). Buttons and CTAs on individual pages are a light-grey
+   fill with charcoal text instead of a solid black one. The fill, border and text colour are
+   inline on each element; this class only adds the interactive states that inline styles cannot
+   express, so it matches nothing that does not carry the class and cannot reach another page. */
+.fx-btn { transition: background-color .15s ease, border-color .15s ease, box-shadow .15s ease; }
+.fx-btn:hover:not(:disabled) { background: #DDE1E4 !important; border-color: #C3C9CE !important; }
+.fx-btn:active:not(:disabled) { background: #D2D7DB !important; }
+.fx-btn:focus-visible { outline: 2px solid #1F7A58; outline-offset: 2px; }
+.fx-btn:disabled { cursor: not-allowed; opacity: .6; }
+@media (prefers-reduced-motion: reduce) { .fx-btn { transition: none; } }

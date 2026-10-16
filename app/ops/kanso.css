@@ -1,0 +1,60 @@
+/* Kanso workspace — scoped to /ops only. Not loaded by the public site. */
+
+/* The whole page was scrollable by a few dozen pixels (visible as the top bar
+   sliding partly off-screen) even though .kanso-root itself is exactly 100vh with
+   overflow:hidden -- that only clips .kanso-root's own descendants, it does nothing
+   about html/body, which still had their default browser margin and no height cap
+   of their own, letting the page itself scroll instead of only the internal panels
+   (Terminal, Agents Feed, Talk to CMO) that are actually meant to scroll. Safe to
+   set globally here since this stylesheet is only ever loaded while on an /ops
+   route (see the file-scope comment above) -- it's removed again once navigating
+   back to the public site. */
+html, body { height: 100%; margin: 0; overflow: hidden; }
+
+.kanso-root, .kanso-root * { box-sizing: border-box; }
+.kanso-root { background: #18181a; }
+.kanso-root a { color: #f2f2f5; text-decoration: none; }
+.kanso-root a:hover { color: #fff; }
+.kanso-root ::selection { background: rgba(86, 210, 192, 0.24); }
+.kanso-root ::-webkit-scrollbar { width: 8px; height: 8px; }
+.kanso-root ::-webkit-scrollbar-track { background: transparent; }
+.kanso-root ::-webkit-scrollbar-thumb { background: #332e2a; border-radius: 8px; border: 2px solid #110f0e; }
+.kanso-root ::-webkit-scrollbar-thumb:hover { background: #45403a; }
+.kanso-root :focus-visible { outline: 2px solid #56d2c0; outline-offset: 2px; }
+.kanso-root input::placeholder, .kanso-root textarea::placeholder { color: #726a5a; }
+
+@keyframes kblink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+@keyframes kpulse { 0%, 100% { opacity: 0.45; } 50% { opacity: 1; } }
+@keyframes kfade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes krise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes kanso-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+.kanso-cursor { animation: kblink 1.05s steps(1) infinite; }
+.kanso-pulse { animation: kpulse 2.4s ease-in-out infinite; }
+.kanso-fade-in { animation: kfade 0.14s linear; }
+.kanso-rise-in { animation: krise 0.2s ease-out; }
+
+/* ── hover utility classes (inline styles can't do :hover, so these
+   mirror the design's `style-hover` attributes as real CSS) ── */
+.kanso-icon-btn:hover { background: #1e1b19; color: #f2f2f5; }
+.kanso-chip:hover { background: #242020; }
+.kanso-ghost-btn:hover { border-color: #56d2c0; color: #56d2c0; }
+.kanso-white-btn:hover { background: #fff; }
+.kanso-danger-btn:hover { background: #241514; color: #ff6666; }
+.kanso-row-hover:hover { background: #1f1f21; }
+.kanso-green-btn:hover { background: #14261c; }
+.kanso-send-btn:hover { background: #fafafc; color: #110f0e; }
+.kanso-plain-icon:hover { color: #f2f2f5; }
+.kanso-collapsed-col:hover { background: #1f1f21; }
+
+/* Clickable card rows in the Competitive Intelligence module (competitor cards, the
+   add-competitor card) -- a subtle border lighten on hover, matching the design's own
+   `style-hover="border-color:#3d3d44"` treatment, done as real CSS since inline
+   styles can't express :hover. */
+.kanso-card-hover { transition: border-color 0.12s ease; }
+.kanso-card-hover:hover { border-color: #3d3d44; }
+
+/* The dashed "Add" card gets the teal treatment on hover, matching the design --
+   distinct from the plain grey lighten above since this one invites a real action. */
+.kanso-add-card { transition: border-color 0.12s ease, color 0.12s ease; }
+.kanso-add-card:hover { border-color: #56d2c0; color: #56d2c0; }

@@ -5,9 +5,9 @@ export async function generateMetadata(): Promise<Metadata> {
   const canonicalPath = 'calculators';
   const canonical = `https://fermor.in/${canonicalPath}/vpf-calculator`;
   return {
-    title: 'VPF Calculator: Voluntary Provident Fund & EPF Maturity',
+    title: 'VPF Calculator: Maturity Value & Interest Online - Fermor',
     description:
-      'Free VPF calculator for India. Calculate voluntary provident fund maturity at 8.25%, combined EPF+VPF corpus, and interest rate history. Free to use.',
+      'Free VPF calculator: enter monthly contribution, rate and years to see maturity value and interest, with the full math shown. No login. Not advice.',
     keywords: [
       'vpf calculator',
       'voluntary provident fund calculator',
